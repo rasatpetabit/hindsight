@@ -665,7 +665,21 @@ async def test_dedup_update_all_updated_sources_deleted_skips_fold_and_delete() 
 
 
 def _batch_engine():
-    return types.SimpleNamespace(_consolidation_llm_config=types.SimpleNamespace(with_config=lambda *a, **k: object()))
+    class _Emb:
+        dimension = 384
+
+        # Phase A now precomputes CREATE embeddings (design §4.2) — provide a stub
+        # embeddings backend so dedup-enabled batch tests exercise the full path.
+        def encode_documents(self, texts, **kwargs):
+            return [[0.1] * 384 for _ in texts]
+
+        def encode_query(self, texts, **kwargs):
+            return [[0.1] * 384 for _ in texts]
+
+    return types.SimpleNamespace(
+        _consolidation_llm_config=types.SimpleNamespace(with_config=lambda *a, **k: object()),
+        embeddings=_Emb(),
+    )
 
 
 class _FakePool:
@@ -720,6 +734,9 @@ async def _run_create_batch(create_action_result: str):
             new=AsyncMock(return_value=_DedupOutcome(best_id=None, merged_text="", should_merge=False)),
         ),
         patch.object(C, "_execute_create_action", new=AsyncMock(return_value=create_action_result)) as create_action,
+        # Phase B re-validates sources under the guard; these unit tests exercise the
+        # create-action wiring, not the store-backed validation, so stub it to "ok".
+        patch.object(C, "_fresh_source_validation", new=AsyncMock(return_value="ok")),
     ):
         result = await C._process_memory_batch(
             pool=_FakePool(),

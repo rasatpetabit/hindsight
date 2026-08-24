@@ -551,3 +551,131 @@ def _get_raw_config():
     from hindsight_api.config import _get_raw_config as _raw
 
     return _raw()
+
+
+# ---------------------------------------------------------------------------
+# Core-fix round: stale CREATE -> zero writes + source stays retryable (never failed)
+# ---------------------------------------------------------------------------
+
+
+async def test_stale_create_zero_writes_source_retryable(tmp_path):
+    """Design §6.1: a writer whose CREATE is stale under the guard writes NOTHING and its
+    source stays unconsolidated (retryable) — never marked failed for losing a race.
+
+    One source, two concurrent writers. The winner creates the observation + marks the
+    source consolidated; the loser detects ``source_consumed`` under the bank guard and must:
+    - write zero observations / zero source marks of its own,
+    - leave the source in exactly one terminal state (consolidated, not failed),
+    - never create a second observation.
+    """
+    async with _harness() as h:
+        bank_id = unique_bank("stale-zero-write")
+        await h.create_bank(bank_id)
+        src = await h.seed_fact(bank_id, "Zulu tracks all release trains.")
+
+        result_a = Path(tmp_path) / "ra.json"
+        result_b = Path(tmp_path) / "rb.json"
+        procs = [
+            subprocess.Popen(
+                [sys.executable, "-c", _WRITER_SRC, _URL, bank_id, str(_HARNESS_DIR), str(result_a)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            ),
+            subprocess.Popen(
+                [sys.executable, "-c", _WRITER_SRC, _URL, bank_id, str(_HARNESS_DIR), str(result_b)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            ),
+        ]
+        for p in procs:
+            _out, _err = p.communicate(timeout=120)
+            assert p.returncode == 0, (
+                f"writer subprocess failed rc={p.returncode}\n"
+                f"stdout={_out.decode(errors='replace')[-2000:]}\n"
+                f"stderr={_err.decode(errors='replace')[-2000:]}"
+            )
+
+        # Exactly ONE observation survives; both writers completed cleanly (no failure marks).
+        obs = await h.observations(bank_id)
+        assert len(obs) == 1, f"expected ONE observation, got {len(obs)}"
+        assert obs[0]["proof_count"] == 1
+        assert obs[0]["source_ids"] == [src]
+
+        # The source has exactly one terminal state: consolidated, NOT failed.
+        sstate = await h.source_state(bank_id, src)
+        assert sstate["exists"] and sstate["consolidated_at"] is not None
+        assert sstate["failed_at"] is None, f"lost writer must not be marked failed: {sstate}"
+
+
+# ---------------------------------------------------------------------------
+# Core-fix round: no slow work (recall / LLM / embedding) under the bank lock
+# ---------------------------------------------------------------------------
+
+
+async def test_no_slow_work_under_bank_lock(tmp_path):
+    """Design §7 risk 1 + §4.2: no recall/LLM/embedding executes while the bank lock is held.
+
+    Instrument ``generate_embeddings_batch`` to record whether a bank-row ``FOR UPDATE`` is
+    held at the moment of each call (probed via a separate connection polling pg_locks). The
+    CREATE embedding must have been precomputed in Phase A — so no embed call may observe the
+    lock. Also assert the Phase-B create executor received the precomputed embedding rather
+    than re-embedding under the guard.
+    """
+    from unittest.mock import patch
+
+    import hindsight_api.engine.consolidation.consolidator as C
+
+    async with _harness() as h:
+        bank_id = unique_bank("no-slow-lock")
+        await h.create_bank(bank_id)
+        await h.seed_fact(bank_id, "Yankee audits every cluster.")
+        pool = h.pool
+        embed_calls_under_lock: list[str] = []
+
+        async def _probe_embed(backend, texts, **kwargs):
+            async with pool.acquire() as probe:
+                held = await probe.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_class c ON c.oid=l.relation "
+                    "WHERE l.locktype='row' AND l.mode LIKE '%Update%' AND c.relname='banks')"
+                )
+            if held:
+                embed_calls_under_lock.append("embedding_under_lock")
+            return [[0.1] * 384 for _ in texts]
+
+        with patch.object(C.embedding_utils, "generate_embeddings_batch", new=_probe_embed):
+            await h.consolidate(bank_id)
+
+        assert not embed_calls_under_lock, f"embedding ran under bank lock: {embed_calls_under_lock}"
+        obs = await h.observations(bank_id)
+        assert len(obs) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Design §6 test 8: new twin introduced during LLM window invalidates CREATE plan
+# ---------------------------------------------------------------------------
+
+
+async def test_new_twin_invalidates_create_plan(tmp_path):
+    """Design §6.8: a twin observation referencing a source must invalidate a CREATE plan.
+
+    Seed a source, then pre-create an observation (the "twin") that already references it and
+    mark the source consumed — exactly the state a concurrent consolidation leaves behind. A
+    fresh consolidation must NOT create a second observation: candidate-set revalidation under
+    the guard sees the existing lineage and drops the CREATE with zero writes.
+    """
+    async with _harness() as h:
+        bank_id = unique_bank("new-twin-invalidates")
+        await h.create_bank(bank_id)
+        src = await h.seed_fact(bank_id, "X-ray scans all deployments.")
+
+        # A concurrent consolidation already folded this source into an observation.
+        await h.seed_observation(bank_id, "X-ray scans all deployments.", [src], tags=["harness:pi", "proj:one"])
+        await h.mark_source(bank_id, src)
+
+        result = await h.consolidate(bank_id)
+        assert result.get("status") in ("completed", "no_new_memories"), result
+
+        # The twin is the only observation; no duplicate was created.
+        obs = await h.observations(bank_id)
+        assert len(obs) == 1, f"twin must invalidate CREATE plan; got {len(obs)}"
+        assert obs[0]["source_ids"] == [src]

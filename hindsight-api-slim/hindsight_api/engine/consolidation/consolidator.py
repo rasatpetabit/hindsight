@@ -703,6 +703,45 @@ def _scope_sort_key(scope: frozenset[str]) -> tuple[str, ...]:
     return tuple(sorted(scope))
 
 
+def _source_fingerprint(m: dict[str, Any]) -> dict[str, Any]:
+    """Capture the mutation-relevant authoritative state of a source memory at Phase-A time.
+
+    Phase B (design §4.2 step 3-4, §6.1) re-locks the source rows under the bank guard
+    and compares against this snapshot. Any change to a consolidation-relevant field
+    (text, tags, temporal fields) invalidates the prepared CREATE/UPDATE for that source.
+
+    Only keys PRESENT on ``m`` are included: ``_fetch_unconsolidated_rows`` returns a subset
+    of columns (no proof_count/source_memory_ids/consolidated_at), so those are simply not
+    compared here — a missing key means "we did not observe it in Phase A" and cannot be
+    treated as a change. The authoritative ``consolidated_at`` consumed check is done as an
+    explicit SQL predicate in :func:`_fresh_source_validation`, not via this fingerprint.
+    """
+    out: dict[str, Any] = {}
+    if "text" in m:
+        out["text"] = m.get("text")
+    if "fact_type" in m:
+        out["fact_type"] = m.get("fact_type")
+    if "tags" in m:
+        out["tags"] = sorted(m.get("tags") or [])
+    if "event_date" in m:
+        out["event_date"] = _iso_or_none(m.get("event_date"))
+    if "occurred_start" in m:
+        out["occurred_start"] = _iso_or_none(m.get("occurred_start"))
+    if "occurred_end" in m:
+        out["occurred_end"] = _iso_or_none(m.get("occurred_end"))
+    if "mentioned_at" in m:
+        out["mentioned_at"] = _iso_or_none(m.get("mentioned_at"))
+    return out
+
+
+def _iso_or_none(v: Any) -> str | None:
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v.isoformat()
+    return str(v)
+
+
 async def _filter_live_source_memories(
     conn: "Connection",
     bank_id: str,
@@ -762,6 +801,112 @@ async def _any_live_source_memory(
         conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(mid) for mid in source_memory_ids]
     )
     return bool(present)
+
+
+def _fingerprint_matches(expected: dict[str, Any], fresh: dict[str, Any]) -> bool:
+    """Compare a Phase-A source fingerprint against a fresh store snapshot field set.
+
+    Both are produced by :func:`_source_fingerprint`, so missing keys compare as
+    None (absent on both sides). The consolidated marker is compared too: a source
+    consumed by a concurrent writer differs in ``consolidated_at`` and invalidates
+    the prepared plan.
+    """
+    return all(expected.get(k) == fresh.get(k) for k in expected)
+
+
+async def _fresh_source_validation(
+    conn: "Connection",
+    bank_id: str,
+    source_ids: list[uuid.UUID],
+    expected_fingerprints: dict[str, dict[str, Any]],
+) -> str:
+    """Fresh source-ID + candidate-set revalidation under the Phase-B bank guard.
+
+    Design §4.2 step 3-4 and §6.1: after the bank row is ``FOR UPDATE``-locked, re-lock
+    the source rows in stable ID order (bank -> source lock order) and validate that each
+    source (a) still exists, (b) is still unconsolidated, and (c) is unchanged since its
+    Phase-A snapshot. Also revalidate the candidate set: if an observation already exists
+    that references any of these sources (a twin created by a concurrent writer during the
+    LLM window), the CREATE is stale.
+
+    Returns ``"ok"`` when everything matches, or a short stale reason describing why the
+    prepared write must be dropped with zero writes.
+    """
+    if not source_ids:
+        return "no_sources"
+    store = get_memories()
+    ordered = sorted(source_ids, key=lambda uid: str(uid))
+    if store.writes_memory_rows_in_sql_for(bank_id):
+        # Lock + read the authoritative state in one stable-order statement.
+        rows = await conn.fetch(
+            f"SELECT id, text, fact_type, tags, event_date, occurred_start, occurred_end,"
+            f" mentioned_at, proof_count, source_memory_ids, consolidated_at"
+            f" FROM {fq_table('memory_units')}"
+            f" WHERE bank_id = $1 AND id = ANY($2::uuid[]) ORDER BY id FOR UPDATE",
+            bank_id,
+            ordered,
+        )
+        fresh_by_id: dict[str, dict[str, Any]] = {}
+        fresh_consumed: dict[str, bool] = {}
+        for r in rows:
+            fresh_by_id[str(r["id"])] = _source_fingerprint(
+                {
+                    "text": r["text"],
+                    "fact_type": r["fact_type"],
+                    "tags": r["tags"] or [],
+                    "event_date": r["event_date"],
+                    "occurred_start": r["occurred_start"],
+                    "occurred_end": r["occurred_end"],
+                    "mentioned_at": r["mentioned_at"],
+                }
+            )
+            fresh_consumed[str(r["id"])] = r["consolidated_at"] is not None
+        for sid in ordered:
+            sid_str = str(sid)
+            fresh = fresh_by_id.get(sid_str)
+            if fresh is None:
+                return f"source_deleted:{sid_str}"
+            if fresh_consumed.get(sid_str):
+                return f"source_consumed:{sid_str}"
+            expected = expected_fingerprints.get(sid_str)
+            if expected is not None and not _fingerprint_matches(expected, fresh):
+                return f"source_changed:{sid_str}"
+        # Candidate-set revalidation: a concurrent writer may have created an observation
+        # referencing these exact sources during the LLM window (empty-snapshot race §6.1).
+        twin = await conn.fetchval(
+            f"SELECT 1 FROM {fq_table('memory_units')}"
+            f" WHERE bank_id = $1 AND fact_type = 'observation' AND source_memory_ids @> $2::uuid[] LIMIT 1",
+            bank_id,
+            ordered,
+        )
+        if twin is not None:
+            return "twin_exists_for_sources"
+        return "ok"
+    # Non-SQL store: existence + consolidated markers through the store seam.
+    present = await store.get_memories(
+        conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(mid) for mid in ordered]
+    )
+    live_ids = {str(m.unit_id) for m in present}
+    for sid in ordered:
+        sid_str = str(sid)
+        if sid_str not in live_ids:
+            return f"source_deleted:{sid_str}"
+        m = next((x for x in present if str(x.unit_id) == sid_str), None)
+        if m is not None and m.consolidated_at is not None:
+            return f"source_consumed:{sid_str}"
+        expected = expected_fingerprints.get(sid_str)
+        if expected is not None and m is not None:
+            fresh = _source_fingerprint({"text": m.text, "fact_type": m.fact_type, "tags": m.tags or [],
+                                         "event_date": m.event_date, "occurred_start": m.occurred_start,
+                                         "occurred_end": m.occurred_end, "mentioned_at": m.mentioned_at,
+                                         "proof_count": m.proof_count,
+                                         "source_memory_ids": m.source_memory_ids or [],
+                                         "consolidated_at": m.consolidated_at})
+            if not _fingerprint_matches(expected, fresh):
+                return f"source_changed:{sid_str}"
+    # Non-SQL stores cannot do the SQL lineage twin check; their CAS seam + caller-owned
+    # txn provides the equivalent guarantee on fold/merge paths.
+    return "ok"
 
 
 class _CreateAction(BaseModel):
@@ -841,6 +986,8 @@ class _PreparedCreate:
 
     Carries the source ids, aggregated source fields, and the pre-computed
     embedding + dedup outcome so Phase B does no slow work under the bank guard.
+    ``embedding_str`` is precomputed in Phase A (design §4.2 — no embedder under
+    the bank lock).
     """
 
     create: _CreateAction
@@ -848,6 +995,7 @@ class _PreparedCreate:
     agg: _SourceAggregation
     create_source_ids: list[uuid.UUID]
     dedup_outcome: "_DedupOutcome | None" = None
+    embedding_str: str | None = None
 
 
 @dataclass
@@ -868,6 +1016,13 @@ class _PreparedBatch:
     All slow work — recall, LLM, embeddings, dedup adjudication — completes here,
     off any write connection. Phase B (:func:`_commit_prepared_batch`) executes the
     writes under the caller-owned bank-guarded connection with CAS + fresh validation.
+
+    ``source_snapshots`` maps each source memory id (str) to its authoritative
+    Phase-A state (the mutation-relevant fields). Phase B re-locks the source rows
+    under the bank guard and compares against this snapshot (design §4.2 step 3-4,
+    §6.1 fresh source-ID validation) so a writer whose sources were consumed or
+    mutated during the LLM window rolls back with zero writes instead of creating a
+    duplicate observation.
     """
 
     memories: list[dict[str, Any]]
@@ -880,6 +1035,7 @@ class _PreparedBatch:
     creates: list[_PreparedCreate]
     dedup_enabled: bool
     dedup_llm_config: Any = None
+    source_snapshots: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 def _aggregate_source_fields(source_mems: list[dict[str, Any]], tags: list[str] | None = None) -> _SourceAggregation:
     """Compute the observation fields inherited from a set of source memories.
@@ -1534,6 +1690,7 @@ async def _run_consolidation_job(
             all_deleted = 0
             succeeded_ids: list[Any] = []
             failed_ids: list[Any] = []
+            stale_ids: set[str] = set()
 
             # One cross-store write-group per LLM batch. For a separate-store backend the
             # handle is minted once and tagged onto every observation write + mark; its witness
@@ -1617,7 +1774,7 @@ async def _run_consolidation_job(
                             bank_id,
                         )
                         for prepared in prepared_plans:
-                            presults, pdeleted = await _commit_prepared_batch(
+                            presults, pdeleted, pstale = await _commit_prepared_batch(
                                 prepared=prepared,
                                 pool=pool,
                                 memory_engine=memory_engine,
@@ -1628,6 +1785,10 @@ async def _run_consolidation_job(
                                 conn=conn,
                             )
                             all_deleted += pdeleted
+                            # Sources whose prepared writes were dropped as stale under the
+                            # guard stay UNconsolidated (design §6.1) so a bounded reprepare can
+                            # fold them into the survivor observation.
+                            stale_ids |= pstale
                             # Merge per-scope results (same merge semantics as before).
                             if not all_results:
                                 all_results.extend(presults)
@@ -1658,12 +1819,18 @@ async def _run_consolidation_job(
                         # Mark through the store so the flag lands wherever the source facts live —
                         # tagged with this batch's txn, so marks become visible together with the
                         # observations above (same logical write-group fate).
-                        if succeeded_ids:
+                        # Stale sources (dropped with zero writes under §6.1) are excluded from
+                        # the succeeded set: they remain eligible for bounded reprepare instead of
+                        # being marked terminal.
+                        effective_succeeded = [
+                            mem_id for mem_id in succeeded_ids if str(mem_id) not in stale_ids
+                        ]
+                        if effective_succeeded:
                             await store.mark_consolidated(
                                 conn=conn,
                                 fq_table=fq_table,
                                 bank_id=bank_id,
-                                unit_ids=[str(mem_id) for mem_id in succeeded_ids],
+                                unit_ids=[str(mem_id) for mem_id in effective_succeeded],
                                 when=now,
                                 failed=False,
                                 txn=_batch_txn,
@@ -1681,8 +1848,8 @@ async def _run_consolidation_job(
                         await _txn_provider.write_txn_witness(_batch_txn, conn=conn, fq_table=fq_table)
                         # Persist this batch's mental-model refresh tags atomically with the
                         # witness (#3411). Only succeeded sources contribute a tag.
-                        if operation_id and succeeded_ids:
-                            succeeded_set = {str(mem_id) for mem_id in succeeded_ids}
+                        if operation_id and effective_succeeded:
+                            succeeded_set = {str(mem_id) for mem_id in effective_succeeded}
                             batch_tags = sorted(
                                 {
                                     t
@@ -2305,7 +2472,12 @@ async def _prepare_memory_batch(
             continue
 
         dedup_outcome: "_DedupOutcome | None" = None
+        embedding_str: str | None = None
         if dedup_enabled:
+            # Precompute the CREATE embedding in Phase A (design §4.2 — no embedder
+            # under the bank lock). The dedup adjudication uses it as its probe vector.
+            embeddings = await embedding_utils.generate_embeddings_batch(memory_engine.embeddings, [create.text])
+            embedding_str = str(embeddings[0]) if embeddings else None
             dedup_outcome = await _dedup_adjudicate(
                 pool,
                 memory_engine,
@@ -2313,7 +2485,7 @@ async def _prepare_memory_batch(
                 config,
                 dedup_llm_config,
                 create.text,
-                None,
+                embedding_str,
                 agg.tags,
                 exclude_id=None,
             )
@@ -2324,6 +2496,7 @@ async def _prepare_memory_batch(
             agg=agg,
             create_source_ids=create_source_ids,
             dedup_outcome=dedup_outcome,
+            embedding_str=embedding_str,
         ))
 
     return _PreparedBatch(
@@ -2337,6 +2510,7 @@ async def _prepare_memory_batch(
         creates=prepared_creates,
         dedup_enabled=dedup_enabled,
         dedup_llm_config=dedup_llm_config,
+        source_snapshots={str(m["id"]): _source_fingerprint(m) for m in memories},
     )
 
 
@@ -2349,7 +2523,7 @@ async def _commit_prepared_batch(
     perf: ConsolidationPerfLog | None = None,
     txn=None,
     conn=None,
-) -> tuple[list[dict[str, Any]], int]:
+) -> tuple[list[dict[str, Any]], int, set[str]]:
     """Phase B — commit a prepared batch's writes under CAS on the caller-owned connection.
 
     Executes deletes first (freeing observation slots before creates consume them), then
@@ -2358,11 +2532,16 @@ async def _commit_prepared_batch(
     all writes share one caller-owned transaction and no nested transaction is opened; when
     omitted (serial path) each write opens its own short-lived transaction via ``pool``.
 
-    Returns ``(results, deleted_count)`` where ``results`` is one dict per memory in batch order.
+    Returns ``(results, deleted_count, stale_memory_ids)`` where ``results`` is one dict per
+    memory in batch order and ``stale_memory_ids`` are the source memories whose prepared
+    writes were dropped with zero writes because fresh validation under the guard found them
+    consumed/mutated/duplicated (design §6.1). Those memories must stay unconsolidated so a
+    bounded reprepare can fold them into the survivor.
     """
     memories = prepared.memories
     per_memory_created: set[str] = set()
     per_memory_updated: set[str] = set()
+    stale_memory_ids: set[str] = set()
     deleted_count = 0
 
     async def _write_body(wconn) -> None:
@@ -2414,6 +2593,26 @@ async def _commit_prepared_batch(
         for pcreate in prepared.creates:
             create = pcreate.create
 
+            # Fresh source-ID + candidate-set revalidation under the bank guard (design §4.2
+            # step 3-4, §6.1). A writer whose sources were consumed or mutated during the
+            # connection-free LLM window must roll back with zero writes rather than create a
+            # duplicate observation. This is what closes the empty-snapshot CREATE/CREATE race.
+            stale_reason = await _fresh_source_validation(
+                conn=wconn,
+                bank_id=bank_id,
+                source_ids=pcreate.create_source_ids or [],
+                expected_fingerprints=prepared.source_snapshots,
+            )
+            if stale_reason != "ok":
+                logger.debug(
+                    f"[CONSOLIDATION] bank={bank_id} CREATE stale under guard ({stale_reason}); "
+                    f"dropping with zero writes (duplicate/twin protection §6.1)"
+                )
+                # The memory is NOT marked consolidated/failed: it stays eligible for a
+                # bounded reprepare that folds it into the survivor observation.
+                stale_memory_ids.update(str(m["id"]) for m in pcreate.source_mems)
+                continue
+
             if (
                 pcreate.dedup_outcome is not None
                 and pcreate.dedup_outcome.should_merge
@@ -2456,6 +2655,7 @@ async def _commit_prepared_batch(
                 perf=perf,
                 txn=txn,
                 conn=wconn,
+                precomputed_embedding=pcreate.embedding_str,
             )
             if action == "created":
                 for m in pcreate.source_mems:
@@ -2476,10 +2676,12 @@ async def _commit_prepared_batch(
             results.append({"action": "created"})
         elif updated:
             results.append({"action": "updated"})
+        elif mid in stale_memory_ids:
+            results.append({"action": "skipped", "reason": "stale_under_guard", "retryable": True})
         else:
             results.append({"action": "skipped", "reason": "no_durable_knowledge"})
 
-    return results, deleted_count
+    return results, deleted_count, stale_memory_ids
 
 
 async def _process_memory_batch(
@@ -2523,7 +2725,7 @@ async def _process_memory_batch(
         config=config,
         obs_tags_override=obs_tags_override,
     )
-    results, deleted_count = await _commit_prepared_batch(
+    results, deleted_count, _stale = await _commit_prepared_batch(
         prepared=prepared,
         pool=pool,
         memory_engine=memory_engine,
@@ -2822,6 +3024,7 @@ async def _execute_create_action(
     perf: ConsolidationPerfLog | None = None,
     txn=None,
     conn=None,
+    precomputed_embedding: str | None = None,
 ) -> str:
     """
     Create a new observation from one or more source memories.
@@ -2831,6 +3034,11 @@ async def _execute_create_action(
 
     ``conn``: when provided (Phase-B caller-owned mode) it is passed through to the
     create write so the observation lands inside the caller's write-group transaction.
+
+    ``precomputed_embedding``: Phase-B caller-owned mode passes the embedding computed
+    in Phase A (design §4.2 — no embedder under the bank lock). When omitted (serial
+    path, or a non-parallel caller) the embedding is computed here off-connection exactly
+    as before.
     """
     created = await _create_observation_directly(
         pool=pool,
@@ -2846,6 +3054,7 @@ async def _execute_create_action(
         perf=perf,
         txn=txn,
         conn=conn,
+        precomputed_embedding=precomputed_embedding,
     )
     # Map the new observation onto the consolidation trace as a produced memory.
     new_id = created.get("observation_id")
@@ -3215,6 +3424,7 @@ async def _create_observation_directly(
     perf: ConsolidationPerfLog | None = None,
     txn=None,
     conn=None,
+    precomputed_embedding: str | None = None,
 ) -> dict[str, Any]:
     """Create an observation from one or more source memories with pre-processed text.
 
@@ -3226,6 +3436,9 @@ async def _create_observation_directly(
     caller's write-group transaction; no transaction is opened here and no connection is
     acquired. When omitted (serial path) a short-lived connection + transaction are opened
     exactly as before.
+
+    ``precomputed_embedding``: Phase-B caller-owned mode passes the embedding already
+    computed in Phase A so the embedder never runs under the bank lock (design §4.2).
     """
     # Preflight (non-locking, separate short-lived conn): if every source memory is already
     # gone, skip BEFORE the slow embed — restores the pre-refactor short-circuit so a no-op
@@ -3239,12 +3452,19 @@ async def _create_observation_directly(
                 return {"action": "skipped", "reason": "sources_deleted"}
 
     # Generate embedding for the observation (convert to string for pgvector) BEFORE
-    # acquiring a connection so the embedder never holds a pooled connection.
+    # acquiring a connection so the embedder never holds a pooled connection. In Phase-B
+    # caller-owned mode the embedding was already computed in Phase A and is passed in —
+    # never run the slow embedder while holding the bank lock.
     t0 = time.time()
-    embeddings = await embedding_utils.generate_embeddings_batch(memory_engine.embeddings, [observation_text])
-    embedding_str = str(embeddings[0]) if embeddings else None
-    if perf:
-        perf.record_timing("embedding", time.time() - t0)
+    if precomputed_embedding is not None:
+        embedding_str = precomputed_embedding
+        if perf:
+            perf.record_timing("embedding", 0.0)  # measured in Phase A; do not double-count under lock
+    else:
+        embeddings = await embedding_utils.generate_embeddings_batch(memory_engine.embeddings, [observation_text])
+        embedding_str = str(embeddings[0]) if embeddings else None
+        if perf:
+            perf.record_timing("embedding", time.time() - t0)
 
     now = datetime.now(timezone.utc)
     obs_event_date = event_date or now

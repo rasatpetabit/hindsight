@@ -146,8 +146,9 @@ async def test_commit_phase_b_applies_create_via_cas_on_caller_conn():
         patch.object(C, "_execute_create_action", new=create_action),
         patch.object(C, "_execute_update_action", new=AsyncMock(return_value=None)),
         patch.object(C, "_execute_delete_action", new=AsyncMock()),
+        patch.object(C, "_fresh_source_validation", new=AsyncMock(return_value="ok")),
     ):
-        results, deleted = await C._commit_prepared_batch(
+        results, deleted, _stale = await C._commit_prepared_batch(
             prepared=prepared,
             pool=None,
             memory_engine=types.SimpleNamespace(embeddings=object()),
@@ -210,6 +211,7 @@ async def test_bank_guard_for_update_is_issued_once_per_batch():
         patch.object(C, "_execute_create_action", new=AsyncMock(return_value="skipped")),
         patch.object(C, "_execute_update_action", new=AsyncMock(return_value=None)),
         patch.object(C, "_execute_delete_action", new=AsyncMock()),
+        patch.object(C, "_fresh_source_validation", new=AsyncMock(return_value="ok")),
     ):
         await C._commit_prepared_batch(
             prepared=prepared,
