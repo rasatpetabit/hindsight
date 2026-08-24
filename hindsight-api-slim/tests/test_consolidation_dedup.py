@@ -24,7 +24,7 @@ from hindsight_api.engine.consolidation.consolidator import (
     _duplicate_create_target,
     _norm_obs_text,
 )
-from hindsight_api.engine.memories import RecallArms
+from hindsight_api.engine.memories import CASOutcome, RecallArms
 from hindsight_api.engine.search.types import RetrievalResult
 
 
@@ -83,24 +83,30 @@ def _obs(text: str, sim: float, oid: str = _TWIN_ID) -> RetrievalResult:
     return RetrievalResult(id=oid, text=text, fact_type="observation", similarity=sim)
 
 
-class _DedupConn:
-    """Backend-shaped conn for dedup-fold tests. Enforces that the live-source filter and
-    the fold UPDATE run inside the fold transaction on an acquired connection, and that the
-    fold UPDATE is RETURNING-gated."""
+def _snap(unit_id, sources=(), revision="rev-1"):
+    """A MemorySnapshot-shaped fake: only the fields consolidation reads (revision,
+    memory.source_memory_ids) are modeled."""
+    return types.SimpleNamespace(
+        memory=types.SimpleNamespace(source_memory_ids=list(sources)),
+        revision=revision,
+    )
+
+
+class _CasConn:
+    """Backend-shaped conn for dedup-fold tests in the CAS-seam world.
+
+    The live-source filter still runs as a FOR SHARE SELECT on the connection inside the
+    write-group transaction (SQL store path); snapshot + fold + delete now go through the
+    store's CAS seam (mock store), not raw SQL on this conn.
+    """
 
     def __init__(self):
-        self.active = 0  # >0 while a connection is acquired (set by _DedupBackend.acquire)
+        self.active = 0  # >0 while a connection is acquired (set by _CasBackend.acquire)
         self._in_txn = False
-        self.fetchval_result = uuid.UUID(_TWIN_ID)  # survivor id the fold "returns"
-        self.fetchrow_result = None  # update-path source snapshot
         self.live_rows = None  # override liveness rows; None -> echo all source ids as live
-        # Modeled row text so the fold/snapshot text guards actually bite. None -> "match any"
-        # (keeps every pre-existing test, which never sets these, behaving as before).
-        self.current_twin_text = None  # survivor/twin row's current text (create + update folds)
-        self.current_updated_text = None  # updated row's current text (update snapshot + fold)
-        self.fetchval = AsyncMock(side_effect=self._fetchval)
         self.fetch = AsyncMock(side_effect=self._fetch)
-        self.fetchrow = AsyncMock(side_effect=self._fetchrow)
+        self.fetchval = AsyncMock()
+        self.fetchrow = AsyncMock()
         self.execute = AsyncMock()
 
     @asynccontextmanager
@@ -112,42 +118,15 @@ class _DedupConn:
         finally:
             self._in_txn = False
 
-    async def _fetchval(self, query, *args):
-        assert self._in_txn, "fold UPDATE must run inside the fold transaction"
-        assert "RETURNING" in query, "fold UPDATE must be RETURNING-gated"
-        # Assert the text-guard CLAUSE is present (not just that the arg is passed) so deleting the SQL
-        # guard fails even if the param is left behind, then model the guarded row text so a stale-text
-        # fold matches no row. ``args`` excludes the bound ``query``.
-        if "u.text" in query:  # update-path fold
-            assert "t.text = $4" in query and "u.text = $5" in query, "update fold must keep both text guards"
-            if self.current_twin_text is not None and args[3] != self.current_twin_text:
-                return None
-            if self.current_updated_text is not None and args[4] != self.current_updated_text:
-                return None
-        else:  # create-path fold
-            assert "AND text = $4" in query, "create fold must keep the twin text guard (AND text = $4)"
-            if self.current_twin_text is not None and args[3] != self.current_twin_text:
-                return None
-        return self.fetchval_result
-
     async def _fetch(self, query, source_ids, bank_id):
-        assert self._in_txn, "live-source filter must run inside the fold transaction"
+        assert self._in_txn, "live-source filter must run inside the write-group transaction"
         assert "FOR SHARE" in query, "live-source filter must hold FOR SHARE on the source rows"
         if self.live_rows is not None:
             return self.live_rows
         return [{"id": s} for s in source_ids]
 
-    async def _fetchrow(self, query, *args):
-        # Assert the text-guard CLAUSE is present (so deleting it fails even if the arg stays), then
-        # model the updated row's text so a row rewritten during the LLM window snapshots as gone.
-        # ``args`` excludes the bound ``query``.
-        assert "AND text = $2" in query, "update snapshot must keep the updated-text guard (AND text = $2)"
-        if self.current_updated_text is not None and args[1] != self.current_updated_text:
-            return None
-        return self.fetchrow_result
 
-
-class _DedupBackend:
+class _CasBackend:
     """Backend-shaped stand-in matching acquire_with_retry's ``_wraps_backend`` path."""
 
     _wraps_backend = True
@@ -177,11 +156,17 @@ def _make_dedup_llm(conn):
 
 
 def _ctx(threshold: float = 0.97):
-    """Return (kwargs, conn_mock, llm_mock) for a _dedup_reconcile_create call."""
-    conn = _DedupConn()
+    """Return (kwargs, store_mock) for a _dedup_reconcile_create call.
+
+    The store is patched at ``get_memories`` and carries the task-1 CAS seam
+    (snapshot_memories / cas_fold_observation / cas_delete_memory) plus recall_unified and the
+    SQL-path flag. ``conn`` rides on the backend used by ``pool`` for the live-source filter.
+    """
+    conn = _CasConn()
+    store = _make_cas_store()
     llm = _make_dedup_llm(conn)
     kwargs = dict(
-        pool=_DedupBackend(conn),
+        pool=_CasBackend(conn),
         memory_engine=types.SimpleNamespace(embeddings=object()),
         bank_id="bank1",
         # The merge path builds a search_vector UPDATE clause from the text-search
@@ -196,14 +181,53 @@ def _ctx(threshold: float = 0.97):
         create_source_ids=[uuid.uuid4()],
         tags=["t1"],
     )
-    return kwargs, conn, llm
+    return kwargs, store, conn
 
 
-def _patch_probe(results):
-    # Dedup's candidate probe now goes through the memories store's unified recall method (dense
-    # arm only), so stub the store rather than the old routing wrapper.
-    store = types.SimpleNamespace(recall_unified=AsyncMock(return_value={"observation": RecallArms(semantic=results)}))
-    return patch("hindsight_api.engine.memories.get_memories", lambda: store)
+def _make_cas_store():
+    """A fake memories store exposing the task-1 CAS seam for dedup-fold tests.
+
+    SQL-path by default (``writes_memory_rows_in_sql_for`` True). Default fold/snapshot/delete
+    outcomes are APPLIED / present / APPLIED; individual tests override them.
+    """
+    store = types.SimpleNamespace(
+        recall_unified=AsyncMock(),
+        snapshot_memories=AsyncMock(return_value=[_snap(_TWIN_ID)]),
+        cas_fold_observation=AsyncMock(return_value=CASOutcome.APPLIED),
+        cas_delete_memory=AsyncMock(return_value=CASOutcome.APPLIED),
+        writes_sql=True,
+    )
+
+    def _writes_sql(bank_id):
+        return store.writes_sql
+
+    store.writes_memory_rows_in_sql_for = _writes_sql
+    return store
+
+
+def _patch_probe(results, store):
+    """Wire ``results`` into ``store.recall_unified`` (the obs-anchored ANN probe)."""
+    store.recall_unified.return_value = {"observation": RecallArms(semantic=results)}
+    return _patch_store(store)
+
+
+def _patch_store(store):
+    """Patch get_memories to return a specific CAS-seam store fake.
+
+    Patching is applied at BOTH namespaces because the consolidator binds the module-level
+    ``from ..memories import get_memories`` reference (fold paths) while ``_dedup_adjudicate``
+    re-imports it locally from the package (recall probe). One namespace alone would leak the
+    real store into the other path.
+    """
+    from contextlib import ExitStack
+    from unittest.mock import patch as _patch
+
+    _stack = ExitStack()
+    _stack.enter_context(_patch("hindsight_api.engine.memories.get_memories", lambda: store))
+    _stack.enter_context(
+        _patch("hindsight_api.engine.consolidation.consolidator.get_memories", lambda: store)
+    )
+    return _stack
 
 
 def _patch_embed():
@@ -214,32 +238,35 @@ def _patch_embed():
 
 
 async def test_dedup_no_twin_above_threshold_returns_none() -> None:
-    kwargs, conn, llm = _ctx(threshold=0.97)
-    with _patch_embed(), _patch_probe([_obs("something loosely related", 0.81)]):
+    kwargs, store, conn = _ctx(threshold=0.97)
+    llm = kwargs["dedup_llm_config"]
+    with _patch_embed(), _patch_probe([_obs("something loosely related", 0.81)], store):
         result = await _dedup_reconcile_create(**kwargs)
     assert result is None
     llm.call.assert_not_called()  # below threshold → no LLM call
-    conn.fetchval.assert_not_called()  # no merge
+    store.cas_fold_observation.assert_not_called()  # no merge
 
 
 async def test_dedup_llm_keep_does_not_merge() -> None:
-    kwargs, conn, llm = _ctx()
+    kwargs, store, conn = _ctx()
+    llm = kwargs["dedup_llm_config"]
     llm.call.return_value = '{"action": "keep", "text": "", "reason": "different language"}'
-    with _patch_embed(), _patch_probe([_obs("Uzbek content on YouTube is described as very rich.", 0.98)]):
+    with _patch_embed(), _patch_probe([_obs("Uzbek content on YouTube is described as very rich.", 0.98)], store):
         result = await _dedup_reconcile_create(**kwargs)
     assert result is None
     llm.call.assert_awaited_once()
-    conn.fetchval.assert_not_called()  # kept distinct → no merge
+    store.cas_fold_observation.assert_not_called()  # kept distinct → no merge
 
 
 async def test_dedup_llm_missing_action_defaults_to_keep() -> None:
-    kwargs, conn, llm = _ctx()
+    kwargs, store, conn = _ctx()
+    llm = kwargs["dedup_llm_config"]
     llm.call.return_value = _DedupDecision(reason="underfilled structured response")
-    with _patch_embed(), _patch_probe([_obs("Uzbek content on YouTube is described as very rich.", 0.98)]):
+    with _patch_embed(), _patch_probe([_obs("Uzbek content on YouTube is described as very rich.", 0.98)], store):
         result = await _dedup_reconcile_create(**kwargs)
     assert result is None
     llm.call.assert_awaited_once()
-    conn.fetchval.assert_not_called()  # missing action is a conservative no-merge
+    store.cas_fold_observation.assert_not_called()  # missing action is a conservative no-merge
 
 
 def test_dedup_decision_accepts_exact_valid_actions() -> None:
@@ -322,44 +349,50 @@ def test_dedup_prompt_contract_requests_json_not_key_value() -> None:
 
 
 async def test_dedup_llm_merge_folds_into_twin() -> None:
-    kwargs, conn, llm = _ctx()
+    kwargs, store, conn = _ctx()
     kwargs["create_source_ids"] = [uuid.uuid4(), uuid.uuid4()]
+    llm = kwargs["dedup_llm_config"]
     llm.call.return_value = (
         '{"action": "merge", "text": "Uzbek content on YouTube is very rich.", "reason": "same fact"}'
     )
-    with _patch_embed(), _patch_probe([_obs("Uzbek content on YouTube is described as very rich.", 0.99)]):
+    with _patch_embed(), _patch_probe([_obs("Uzbek content on YouTube is described as very rich.", 0.99)], store):
         result = await _dedup_reconcile_create(**kwargs)
     assert result == _TWIN_ID  # merged into the twin; caller skips the CREATE
-    conn.fetchval.assert_awaited_once()  # fold is a RETURNING-gated UPDATE
-    args = conn.fetchval.await_args.args
-    assert args[1] == "Uzbek content on YouTube is very rich."  # merged text persisted
-    assert args[2] == kwargs["create_source_ids"]  # new (live) source facts folded in
-    assert args[3] == uuid.UUID(_TWIN_ID)  # onto the twin row
+    # Fresh snapshot of the twin precedes the CAS fold (revision-token gate).
+    store.snapshot_memories.assert_awaited_once()
+    store.cas_fold_observation.assert_awaited_once()
+    fold_kwargs = store.cas_fold_observation.await_args.kwargs
+    assert fold_kwargs["merged_text"] == "Uzbek content on YouTube is very rich."  # merged text persisted
+    assert fold_kwargs["add_source_ids"] == [str(s) for s in kwargs["create_source_ids"]]  # new (live) sources folded in
+    assert fold_kwargs["observation_id"] == _TWIN_ID  # onto the twin row
+    assert store.cas_fold_observation.return_value == CASOutcome.APPLIED
 
 
 async def test_dedup_llm_merge_sanitizes_text_before_write() -> None:
-    # The merge path writes the LLM's synthesized text straight to the fold UPDATE, so it needs
+    # The merge path writes the LLM's synthesized text straight to the CAS fold, so it needs
     # the same character-safety scrub _CreateAction/_UpdateAction already apply via field_validator.
     # A raw NUL reaching the driver breaks the Postgres UTF-8 encode.
-    kwargs, conn, llm = _ctx()
+    kwargs, store, conn = _ctx()
     kwargs["create_source_ids"] = [uuid.uuid4(), uuid.uuid4()]
+    llm = kwargs["dedup_llm_config"]
     llm.call.return_value = _DedupDecision(
         action="merge", text="Uzbek content\x00 on YouTube is very rich.", reason="same fact"
     )
-    with _patch_embed(), _patch_probe([_obs("Uzbek content on YouTube is described as very rich.", 0.99)]):
+    with _patch_embed(), _patch_probe([_obs("Uzbek content on YouTube is described as very rich.", 0.99)], store):
         result = await _dedup_reconcile_create(**kwargs)
     assert result == _TWIN_ID  # still folds into the twin
-    conn.fetchval.assert_awaited_once()
-    args = conn.fetchval.await_args.args
-    assert "\x00" not in args[1]  # the control character never reaches SQL
-    assert args[1] == "Uzbek content on YouTube is very rich."  # scrubbed, not mangled
+    store.cas_fold_observation.assert_awaited_once()
+    folded_text = store.cas_fold_observation.await_args.kwargs["merged_text"]
+    assert "\x00" not in folded_text  # the control character never reaches SQL
+    assert folded_text == "Uzbek content on YouTube is very rich."  # scrubbed, not mangled
 
 
 async def test_dedup_picks_highest_above_threshold_skips_below() -> None:
     # Only the >=threshold candidate is considered; a 0.95 result is ignored at threshold 0.97.
-    kwargs, conn, llm = _ctx(threshold=0.97)
+    kwargs, store, conn = _ctx(threshold=0.97)
+    llm = kwargs["dedup_llm_config"]
     llm.call.return_value = _DedupDecision(action="keep")
-    with _patch_embed(), _patch_probe([_obs("near but distinct", 0.95), _obs("the real twin", 0.98)]):
+    with _patch_embed(), _patch_probe([_obs("near but distinct", 0.95), _obs("the real twin", 0.98)], store):
         await _dedup_reconcile_create(**kwargs)
     # the twin passed to the LLM is the >=0.97 one, not the 0.95
     sent = llm.call.await_args.kwargs["messages"][0]["content"]
@@ -376,13 +409,27 @@ async def test_dedup_picks_highest_above_threshold_skips_below() -> None:
 _UPDATED_ID = "44444444-4444-4444-8444-444444444444"
 
 
-def _update_ctx(threshold: float = 0.97):
-    """Return (kwargs, conn_mock, llm_mock) for a _dedup_reconcile_update call."""
-    conn = _DedupConn()
-    conn.fetchrow_result = {"source_memory_ids": [uuid.uuid4(), uuid.uuid4()]}
+def _update_ctx(threshold: float = 0.97, updated_sources=None):
+    """Return (kwargs, store, conn) for a _dedup_reconcile_update call."""
+    conn = _CasConn()
+    store = _make_cas_store()
+    # snapshot_memories returns per-id snapshots; side_effect maps [twin] / [updated] lookups.
+    store.snapshot_memories.side_effect = None
+    store.snapshot_memories.return_value = None  # placeholder; overridden per call in the fold
+    if updated_sources is None:
+        updated_sources = [uuid.uuid4(), uuid.uuid4()]
+    store._updated_sources = updated_sources
+
+    def _snapshots(conn=None, fq_table=None, bank_id=None, unit_ids=None):
+        # unit_ids is a list with one id: return the twin or the updated row's snapshot.
+        if unit_ids == [_TWIN_ID]:
+            return [_snap(_TWIN_ID)]
+        return [_snap(unit_ids[0], sources=store._updated_sources)]
+
+    store.snapshot_memories.side_effect = _snapshots
     llm = _make_dedup_llm(conn)
     kwargs = dict(
-        pool=_DedupBackend(conn),
+        pool=_CasBackend(conn),
         memory_engine=types.SimpleNamespace(embeddings=object()),
         bank_id="bank1",
         # The merge path builds a search_vector UPDATE clause from the text-search
@@ -398,60 +445,65 @@ def _update_ctx(threshold: float = 0.97):
         updated_emb_str="[0.1, 0.2, 0.3]",  # already embedded by _execute_update_action
         tags=["t1"],
     )
-    return kwargs, conn, llm
+    return kwargs, store, conn
 
 
 async def test_dedup_update_merge_folds_into_twin_and_deletes_updated() -> None:
-    kwargs, conn, llm = _update_ctx()
+    kwargs, store, conn = _update_ctx()
+    llm = kwargs["dedup_llm_config"]
     llm.call.return_value = _DedupDecision(action="merge", text="Uzbek YouTube content is very rich and growing.")
-    with _patch_probe([_obs("Uzbek content on YouTube is described as very rich.", 0.98)]):
+    with (
+        _patch_probe([_obs("Uzbek content on YouTube is described as very rich.", 0.98)], store),
+        _patch_store(store),
+    ):
         await _dedup_reconcile_update(**kwargs)
     llm.call.assert_awaited_once()
-    # The fold-into-twin is a RETURNING-gated UPDATE (fetchval); it folds only the updated row's
-    # LIVE sources (snapshotted via fetchrow, filtered FOR SHARE).
-    conn.fetchval.assert_awaited_once()
-    fold_args = conn.fetchval.await_args.args
-    assert fold_args[1] == "Uzbek YouTube content is very rich and growing."  # merged text on the twin
-    assert fold_args[2] == uuid.UUID(_TWIN_ID)  # survivor = the twin
-    assert fold_args[3] == uuid.UUID(_UPDATED_ID)  # folded-from = the updated row
-    assert fold_args[6] == conn.fetchrow_result["source_memory_ids"]  # only live updated-row sources
-    # Then the updated row is deleted: DELETE of the row, and DELETE of its observation_history
-    # (no longer cascaded from memory_units — that FK was dropped).
-    assert conn.execute.await_count == 2
-    delete_args = conn.execute.await_args_list[0].args
-    assert delete_args[1] == uuid.UUID(_UPDATED_ID)  # the updated row is deleted
-    history_delete_args = conn.execute.await_args_list[1].args
+    # The fold-into-twin is a CAS fold gated on fresh revision tokens; it folds only the
+    # updated row's LIVE sources (snapshotted fresh + filtered FOR SHARE).
+    store.cas_fold_observation.assert_awaited_once()
+    fold_kwargs = store.cas_fold_observation.await_args.kwargs
+    assert fold_kwargs["merged_text"] == "Uzbek YouTube content is very rich and growing."  # merged text on the twin
+    assert fold_kwargs["observation_id"] == _TWIN_ID  # survivor = the twin
+    assert fold_kwargs["add_source_ids"] == [str(s) for s in store._updated_sources]  # live updated-row sources
+    # Then the updated row is deleted via CAS + its observation_history is reclaimed.
+    store.cas_delete_memory.assert_awaited_once()
+    assert store.cas_delete_memory.await_args.kwargs["unit_id"] == _UPDATED_ID
+    assert conn.execute.await_count == 1  # observation_history delete only (row delete went via CAS)
+    history_delete_args = conn.execute.await_args_list[0].args
     assert history_delete_args[2] == uuid.UUID(_UPDATED_ID)  # its history is reclaimed too
 
 
 async def test_dedup_update_keep_does_not_merge() -> None:
-    kwargs, conn, llm = _update_ctx()
+    kwargs, store, conn = _update_ctx()
+    llm = kwargs["dedup_llm_config"]
     llm.call.return_value = _DedupDecision(action="keep", reason="different growth claim")
-    with _patch_probe([_obs("Uzbek content on YouTube is described as very rich.", 0.98)]):
+    with _patch_probe([_obs("Uzbek content on YouTube is described as very rich.", 0.98)], store):
         await _dedup_reconcile_update(**kwargs)
     llm.call.assert_awaited_once()
-    conn.fetchval.assert_not_called()  # kept distinct → no fold
-    conn.execute.assert_not_called()  # → no delete
+    store.cas_fold_observation.assert_not_called()  # kept distinct → no fold
+    store.cas_delete_memory.assert_not_called()  # → no delete
 
 
 async def test_dedup_update_excludes_self() -> None:
     # The probe surfaces the updated observation itself at 1.0; it must be excluded so we don't
     # "merge" a row into itself. With no other candidate, there is no twin → no LLM, no writes.
-    kwargs, conn, llm = _update_ctx()
-    with _patch_probe([_obs("its own current text", 1.0, oid=_UPDATED_ID)]):
+    kwargs, store, conn = _update_ctx()
+    llm = kwargs["dedup_llm_config"]
+    with _patch_probe([_obs("its own current text", 1.0, oid=_UPDATED_ID)], store):
         await _dedup_reconcile_update(**kwargs)
     llm.call.assert_not_called()
-    conn.fetchval.assert_not_called()
-    conn.execute.assert_not_called()
+    store.cas_fold_observation.assert_not_called()
+    store.cas_delete_memory.assert_not_called()
 
 
 async def test_dedup_update_no_twin_above_threshold() -> None:
-    kwargs, conn, llm = _update_ctx(threshold=0.97)
-    with _patch_probe([_obs("loosely related", 0.8)]):
+    kwargs, store, conn = _update_ctx(threshold=0.97)
+    llm = kwargs["dedup_llm_config"]
+    with _patch_probe([_obs("loosely related", 0.8)], store):
         await _dedup_reconcile_update(**kwargs)
     llm.call.assert_not_called()
-    conn.fetchval.assert_not_called()
-    conn.execute.assert_not_called()
+    store.cas_fold_observation.assert_not_called()
+    store.cas_delete_memory.assert_not_called()
 
 
 # ── dedup activation gate (_dedup_active) ─────────────────────────────────────
@@ -499,85 +551,114 @@ def test_dedup_active_none_config() -> None:
 
 
 async def test_dedup_create_twin_vanished_returns_none_so_caller_creates() -> None:
-    # If the twin is deleted during the (connection-free) LLM window, the fold UPDATE matches
-    # no row (fetchval -> None); the helper must return None so the caller still CREATEs.
-    kwargs, conn, llm = _ctx()
-    conn.fetchval_result = None
+    # If the twin is deleted during the (connection-free) LLM window, snapshot_memories finds no
+    # row; the helper must return None so the caller still CREATEs.
+    kwargs, store, conn = _ctx()
+    store.snapshot_memories.return_value = []  # twin vanished
+    llm = kwargs["dedup_llm_config"]
     llm.call.return_value = _DedupDecision(action="merge", text="merged text")
     with (
         _patch_embed(),
-        _patch_probe([_obs("Uzbek content on YouTube is described as very rich.", 0.99)]),
+        _patch_probe([_obs("Uzbek content on YouTube is described as very rich.", 0.99)], store),
+        _patch_store(store),
     ):
         result = await _dedup_reconcile_create(**kwargs)
     assert result is None  # twin gone → don't drop the CREATE
-    conn.fetchval.assert_awaited_once()
+    store.cas_fold_observation.assert_not_called()
 
 
 async def test_dedup_create_fold_uses_only_live_new_sources() -> None:
-    kwargs, conn, llm = _ctx()
+    kwargs, store, conn = _ctx()
     live_source_id = uuid.uuid4()
     deleted_source_id = uuid.uuid4()
     kwargs["create_source_ids"] = [deleted_source_id, live_source_id]
-    conn.live_rows = [{"id": live_source_id}]
+    conn.live_rows = [{"id": live_source_id}]  # only live_source_id survives liveness re-check
+    llm = kwargs["dedup_llm_config"]
     llm.call.return_value = _DedupDecision(action="merge", text="merged text")
     with (
         _patch_embed(),
-        _patch_probe([_obs("Uzbek content on YouTube is described as very rich.", 0.99)]),
+        _patch_probe([_obs("Uzbek content on YouTube is described as very rich.", 0.99)], store),
+        _patch_store(store),
     ):
         result = await _dedup_reconcile_create(**kwargs)
     assert result == _TWIN_ID
-    conn.fetchval.assert_awaited_once()
-    assert conn.fetchval.await_args.args[2] == [live_source_id]
+    store.cas_fold_observation.assert_awaited_once()
+    assert store.cas_fold_observation.await_args.kwargs["add_source_ids"] == [str(live_source_id)]
 
 
 async def test_dedup_create_all_new_sources_deleted_returns_none() -> None:
-    kwargs, conn, llm = _ctx()
+    kwargs, store, conn = _ctx()
     kwargs["create_source_ids"] = [uuid.uuid4(), uuid.uuid4()]
-    conn.live_rows = []
+    conn.live_rows = []  # every source gone under liveness re-check
+    llm = kwargs["dedup_llm_config"]
     llm.call.return_value = _DedupDecision(action="merge", text="merged text")
     with (
         _patch_embed(),
-        _patch_probe([_obs("Uzbek content on YouTube is described as very rich.", 0.99)]),
+        _patch_probe([_obs("Uzbek content on YouTube is described as very rich.", 0.99)], store),
+        _patch_store(store),
     ):
         result = await _dedup_reconcile_create(**kwargs)
     assert result is None
-    conn.fetchval.assert_not_called()
+    store.cas_fold_observation.assert_not_called()
 
 
 async def test_dedup_update_twin_vanished_does_not_delete_updated() -> None:
-    # If the fold matches no row (twin vanished mid-window), the updated row must NOT be deleted.
-    kwargs, conn, llm = _update_ctx()
-    conn.fetchval_result = None
+    # If the twin vanished mid-window (no snapshot), the updated row must NOT be deleted.
+    kwargs, store, conn = _update_ctx()
+    llm = kwargs["dedup_llm_config"]
+    store.snapshot_memories.side_effect = None
+    store.snapshot_memories.return_value = []
+
+    async def _snap_vanish(conn=None, fq_table=None, bank_id=None, unit_ids=None):
+        return [] if unit_ids == [_TWIN_ID] else [_snap(_UPDATED_ID)]
+
+    store.snapshot_memories.side_effect = _snap_vanish
     llm.call.return_value = _DedupDecision(action="merge", text="merged text")
-    with _patch_probe([_obs("Uzbek content on YouTube is described as very rich.", 0.98)]):
+    with (
+        _patch_probe([_obs("Uzbek content on YouTube is described as very rich.", 0.98)], store),
+        _patch_store(store),
+    ):
         await _dedup_reconcile_update(**kwargs)
-    conn.fetchval.assert_awaited_once()  # fold attempted
-    conn.execute.assert_not_called()  # but no delete, since the fold touched nothing
+    store.cas_fold_observation.assert_not_called()  # twin gone → no fold attempted
+    store.cas_delete_memory.assert_not_called()  # and no delete
 
 
 async def test_dedup_update_fold_uses_only_live_updated_sources() -> None:
-    kwargs, conn, llm = _update_ctx()
+    kwargs, store, conn = _update_ctx()
     live_source_id = uuid.uuid4()
-    deleted_source_id = uuid.uuid4()
-    conn.fetchrow_result = {"source_memory_ids": [deleted_source_id, live_source_id]}
-    conn.live_rows = [{"id": live_source_id}]
+    kwargs["updated_text"] = "merged text"
+    llm = kwargs["dedup_llm_config"]
     llm.call.return_value = _DedupDecision(action="merge", text="merged text")
-    with _patch_probe([_obs("Uzbek content on YouTube is described as very rich.", 0.98)]):
+    # Only live_source_id survives the fresh liveness re-check (deleted one is dropped).
+    with (
+        _patch_probe([_obs("Uzbek content on YouTube is described as very rich.", 0.98)], store),
+        _patch_store(store),
+        patch(
+            "hindsight_api.engine.consolidation.consolidator._filter_live_source_memories",
+            AsyncMock(return_value=[live_source_id]),
+        ),
+    ):
         await _dedup_reconcile_update(**kwargs)
-    conn.fetchval.assert_awaited_once()
-    assert conn.fetchval.await_args.args[6] == [live_source_id]
-    conn.execute.assert_awaited()  # fold succeeded → updated row deleted
+    store.cas_fold_observation.assert_called_once()
+    assert store.cas_fold_observation.call_args.kwargs["add_source_ids"] == [str(live_source_id)]
+    store.cas_delete_memory.assert_called_once()  # fold succeeded → updated row deleted
 
 
 async def test_dedup_update_all_updated_sources_deleted_skips_fold_and_delete() -> None:
-    kwargs, conn, llm = _update_ctx()
-    conn.fetchrow_result = {"source_memory_ids": [uuid.uuid4(), uuid.uuid4()]}
-    conn.live_rows = []
+    kwargs, store, conn = _update_ctx()
+    llm = kwargs["dedup_llm_config"]
     llm.call.return_value = _DedupDecision(action="merge", text="merged text")
-    with _patch_probe([_obs("Uzbek content on YouTube is described as very rich.", 0.98)]):
+    with (
+        _patch_probe([_obs("Uzbek content on YouTube is described as very rich.", 0.98)], store),
+        _patch_store(store),
+        patch(
+            "hindsight_api.engine.consolidation.consolidator._filter_live_source_memories",
+            AsyncMock(return_value=[]),  # every updated-row source gone
+        ),
+    ):
         await _dedup_reconcile_update(**kwargs)
-    conn.fetchval.assert_not_called()
-    conn.execute.assert_not_called()
+    store.cas_fold_observation.assert_not_called()
+    store.cas_delete_memory.assert_not_called()
 
 
 # ── _process_memory_batch create-contract (created vs skipped) ────────────────

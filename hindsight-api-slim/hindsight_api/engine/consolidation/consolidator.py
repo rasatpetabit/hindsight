@@ -21,7 +21,7 @@ import logging
 import time
 import uuid
 from collections import defaultdict
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from fnmatch import fnmatchcase
@@ -43,7 +43,7 @@ from ..llm_trace import (
     trace_context_of,
 )
 from ..llm_wrapper import sanitize_llm_output
-from ..memories import FactRecord, get_memories
+from ..memories import CASOutcome, FactRecord, get_memories
 from ..memory_engine import Budget, fq_table
 from ..retain import embedding_utils
 from .prompts import (
@@ -59,6 +59,27 @@ if TYPE_CHECKING:
     from ..response_models import MemoryFact, RecallResult
 
 logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def _write_group(pool, conn=None):
+    """Yield a connection for one logical write-group.
+
+    Serial path (``conn is None``): acquire a short-lived connection from the pool and open
+    one transaction — the executor owns both, so each action commits independently.
+
+    Phase-B path (``conn`` given): yield the caller-owned connection **without opening a
+    transaction on it** — the caller already holds the bank-level write-group, and nesting
+    a transaction here would both violate the one-write-group invariant and fail inside
+    asyncpg ("cannot perform this operation inside a transaction"). All observation writes
+    and source marks then share that single connection/transaction fate.
+    """
+    if conn is not None:
+        yield conn
+        return
+    async with acquire_with_retry(pool) as c:
+        async with c.transaction():
+            yield c
 
 
 async def _gather_or_cancel(coros: list[Any]) -> list[Any]:
@@ -323,6 +344,9 @@ async def _dedup_reconcile_create(
     create_source_ids: list[uuid.UUID],
     tags: list[str] | None,
     txn=None,
+    *,
+    conn=None,
+    outcome=None,
 ) -> str | None:
     """Semantic dedup for a single CREATE (create-time, focused 1-by-1).
 
@@ -330,60 +354,95 @@ async def _dedup_reconcile_create(
     observation and returns its id (caller skips the CREATE). Returns None when there is
     no near twin or the LLM keeps them distinct.
 
-    The probe/embed/LLM adjudication runs with no connection held; the fold takes a
-    short-lived connection and re-checks source liveness inside the fold transaction.
+    Split for the Phase A / Phase B design (design §4.4): the probe/embed/LLM adjudication
+    runs connection-free in Phase A; the CAS-protected fold is ``_dedup_fold_create`` and runs
+    on the caller-owned Phase-B connection when ``conn`` is given (or on a short-lived
+    connection+transaction on the serial path). Pass a pre-computed ``outcome`` to skip
+    re-adjudication when it already ran in Phase A.
     """
-    outcome = await _dedup_adjudicate(
-        pool, memory_engine, bank_id, config, dedup_llm_config, create_text, None, tags, exclude_id=None
-    )
-    if not outcome.should_merge or outcome.best_id is None:
+    if outcome is None:
+        outcome = await _dedup_adjudicate(
+            pool, memory_engine, bank_id, config, dedup_llm_config, create_text, None, tags, exclude_id=None
+        )
+        if not outcome.should_merge or outcome.best_id is None:
+            return None
+
+    store = get_memories()
+    async with _write_group(pool, conn) as conn:
+        return await _dedup_fold_create(
+            store=store,
+            conn=conn,
+            memory_engine=memory_engine,
+            bank_id=bank_id,
+            config=config,
+            outcome=outcome,
+            create_source_ids=create_source_ids,
+            txn=txn,
+        )
+
+
+async def _dedup_fold_create(
+    *,
+    store,
+    conn,
+    memory_engine: "MemoryEngine",
+    bank_id: str,
+    config: Any,
+    outcome,
+    create_source_ids: list[uuid.UUID],
+    txn=None,
+) -> str | None:
+    """CAS-protected Phase-B fold of a CREATE's sources into its near-twin (design §4.4).
+
+    Runs inside the caller's write-group transaction (the bank guard when in Phase B).
+    Re-checks source liveness fresh, then folds via the store CAS seam: SQL stores use
+    ``cas_fold_observation`` gated on a freshly-snapshotted revision token (strictly stronger
+    than the old RETURNING text-guard — it catches any authoritative-field change, not just a
+    text rewrite); non-SQL stores fall back to ``_reconcile_merge_via_store`` until they ship a
+    real CAS implementation. Returns the twin id on APPLIED; None when there is no fold so the
+    caller proceeds with the CREATE (nothing is lost).
+    """
+    # Re-check liveness inside the fold transaction; CREATE performed the slow embed/LLM
+    # work off-connection, so sources may have been deleted since the decision was made.
+    live_source_ids = await _filter_live_source_memories(conn, bank_id, create_source_ids)
+    if not live_source_ids:
         return None
 
-    # Fold the new source facts into the twin and persist the merged text. The SQL path keeps the
-    # twin's existing embedding (the merged text is >= threshold similar, so it stays
-    # representative and avoids a re-embed + a dialect-specific vector UPDATE).
-    store = get_memories()
-    async with acquire_with_retry(pool) as conn:
-        async with conn.transaction():
-            # Re-check liveness inside the fold transaction; CREATE performed the slow embed/LLM
-            # work off-connection, so sources may have been deleted since the decision was made.
-            live_source_ids = await _filter_live_source_memories(conn, bank_id, create_source_ids)
-            if not live_source_ids:
-                return None
-            if store.writes_memory_rows_in_sql_for(bank_id):
-                # Oracle-safe: _native_search_vector_update emits the to_tsvector clause only for a
-                # native PG tsvector column, "" otherwise (see #3021 — the raw ::regconfig cast
-                # breaks Oracle). RETURNING-gate on the twin's probe-time text so a concurrent
-                # survivor rewrite during the connection-free LLM window can't be clobbered.
-                search_vector_clause = _native_search_vector_update(config, "$1")
-                folded = await conn.fetchval(
-                    f"""
-                    UPDATE {fq_table("memory_units")}
-                    SET text = $1,
-                        source_memory_ids = (SELECT array_agg(DISTINCT e) FROM unnest(source_memory_ids || $2::uuid[]) e),
-                        proof_count = (SELECT count(DISTINCT e) FROM unnest(source_memory_ids || $2::uuid[]) e),
-                        updated_at = now(){search_vector_clause}
-                    WHERE id = $3::uuid AND text = $4
-                    RETURNING id
-                    """,
-                    outcome.merged_text,
-                    live_source_ids,
-                    uuid.UUID(outcome.best_id),
-                    outcome.best_text,
-                )
-                if folded is None:
-                    # The twin vanished (or was rewritten) during the connection-free LLM window.
-                    # Don't skip the CREATE: returning None lets the caller insert the observation
-                    # so nothing is lost.
-                    logger.debug(
-                        "[CONSOLIDATION] dedup-merge target %s vanished before fold; proceeding with CREATE",
-                        outcome.best_id[:8],
-                    )
-                    return None
-            else:
-                await _reconcile_merge_via_store(
-                    store, conn, memory_engine, bank_id, outcome.best_id, outcome.merged_text, live_source_ids, txn=txn
-                )
+    if store.writes_memory_rows_in_sql_for(bank_id):
+        # Snapshot the twin fresh under the caller's transaction to derive its CAS revision.
+        snaps = await store.snapshot_memories(
+            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[outcome.best_id]
+        )
+        if not snaps:
+            # The twin vanished during the connection-free LLM window. Don't skip the CREATE:
+            # returning None lets the caller insert the observation so nothing is lost.
+            logger.debug(
+                "[CONSOLIDATION] dedup-merge target %s vanished before fold; proceeding with CREATE",
+                outcome.best_id[:8],
+            )
+            return None
+        expected_rev = snaps[0].revision
+        folded = await store.cas_fold_observation(
+            conn=conn,
+            fq_table=fq_table,
+            bank_id=bank_id,
+            observation_id=outcome.best_id,
+            expected_revision=expected_rev,
+            merged_text=outcome.merged_text,
+            add_source_ids=[str(s) for s in live_source_ids],
+        )
+        if folded != CASOutcome.APPLIED:
+            # Twin changed since adjudication — do not clobber it; proceed with CREATE.
+            logger.debug(
+                "[CONSOLIDATION] dedup-merge target %s changed during window; proceeding with CREATE",
+                outcome.best_id[:8],
+            )
+            return None
+        return outcome.best_id
+
+    await _reconcile_merge_via_store(
+        store, conn, memory_engine, bank_id, outcome.best_id, outcome.merged_text, live_source_ids, txn=txn
+    )
     return outcome.best_id
 
 
@@ -398,6 +457,9 @@ async def _dedup_reconcile_update(
     updated_emb_str: str | None,
     tags: list[str] | None,
     txn=None,
+    *,
+    conn=None,
+    outcome=None,
 ) -> None:
     """Semantic dedup for an UPDATE (after the observation was rewritten + re-embedded).
 
@@ -408,103 +470,131 @@ async def _dedup_reconcile_update(
     against the others (excluding itself); on "merge", fold the just-updated observation's
     sources into the twin, persist the merged text, and DELETE the updated row. Unlike the
     CREATE path the row already exists, so reconciliation is a fold-and-delete, not a skip.
+
+    Split for the Phase A / Phase B design (design §4.4): adjudication runs connection-free in
+    Phase A; ``_dedup_fold_update`` runs the CAS-protected fold-and-delete on the caller-owned
+    Phase-B connection when ``conn`` is given (or on a short-lived connection+transaction on
+    the serial path). Pass a pre-computed ``outcome`` to skip re-adjudication when it already
+    ran in Phase A.
     """
-    outcome = await _dedup_adjudicate(
-        pool,
-        memory_engine,
-        bank_id,
-        config,
-        dedup_llm_config,
-        updated_text,
-        updated_emb_str,
-        tags,
-        exclude_id=updated_id,
-    )
-    if not outcome.should_merge or outcome.best_id is None:
+    if outcome is None:
+        outcome = await _dedup_adjudicate(
+            pool,
+            memory_engine,
+            bank_id,
+            config,
+            dedup_llm_config,
+            updated_text,
+            updated_emb_str,
+            tags,
+            exclude_id=updated_id,
+        )
+        if not outcome.should_merge or outcome.best_id is None:
+            return
+
+    store = get_memories()
+    async with _write_group(pool, conn) as conn:
+        await _dedup_fold_update(
+            store=store,
+            conn=conn,
+            memory_engine=memory_engine,
+            bank_id=bank_id,
+            config=config,
+            outcome=outcome,
+            updated_id=updated_id,
+            updated_text=updated_text,
+            txn=txn,
+        )
+
+
+async def _dedup_fold_update(
+    *,
+    store,
+    conn,
+    memory_engine: "MemoryEngine",
+    bank_id: str,
+    config: Any,
+    outcome,
+    updated_id: str,
+    updated_text: str,
+    txn=None,
+) -> None:
+    """CAS-protected Phase-B fold-and-delete of an updated observation into its twin.
+
+    Runs inside the caller's write-group transaction (the bank guard when in Phase B).
+
+    The all_strict/any tag match guarantees twin and updated share scope, so dropping the
+    updated row's tags loses no visibility. Temporal fields follow the surviving twin (minimal
+    scope; matches create). The fold + delete share one logical write-group so the twin gains
+    the sources exactly as the redundant row is removed; adjudication already ran connection-free.
+
+    SQL stores fold via ``cas_fold_observation`` gated on fresh revision tokens for both rows
+    (strictly stronger than the old RETURNING text-guard) and delete via ``cas_delete_memory``;
+    non-SQL stores fall back to ``_reconcile_merge_via_store`` until they ship real CAS.
+    """
+    if store.writes_memory_rows_in_sql_for(bank_id):
+        # Snapshot both rows fresh under the caller's transaction. Lock order must be
+        # sources-before-observation: _filter_live_source_memories takes FOR SHARE on SOURCE rows
+        # first, then snapshot_memories/cas take FOR UPDATE on observation rows — same order as the
+        # normal write paths (_create_observation_directly / _execute_update_action).
+        upd_snap = await store.snapshot_memories(
+            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[updated_id]
+        )
+        if not upd_snap:
+            # Updated row vanished during the LLM window — nothing to reconcile.
+            return
+        upd_sources = list(upd_snap[0].memory.source_memory_ids or [])
+        live_u_sources = await _filter_live_source_memories(conn, bank_id, upd_sources)
+        if not live_u_sources:
+            return
+
+        twin_snap = await store.snapshot_memories(
+            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[outcome.best_id]
+        )
+        if not twin_snap:
+            # Twin vanished during the LLM window — keep the updated row as a distinct observation.
+            return
+
+        folded = await store.cas_fold_observation(
+            conn=conn,
+            fq_table=fq_table,
+            bank_id=bank_id,
+            observation_id=outcome.best_id,
+            expected_revision=twin_snap[0].revision,
+            merged_text=outcome.merged_text,
+            add_source_ids=[str(s) for s in live_u_sources],
+        )
+        if folded != CASOutcome.APPLIED:
+            # Twin changed during the window — keep the updated row instead of folding a stale twin.
+            return
+        # Fold applied: delete the now-redundant updated row via CAS + its history.
+        await store.cas_delete_memory(
+            conn=conn,
+            fq_table=fq_table,
+            bank_id=bank_id,
+            unit_id=updated_id,
+            expected_revision=upd_snap[0].revision,
+        )
+        await _delete_observation_history(conn, bank_id, updated_id)
+        logger.info(
+            "[CONSOLIDATION] dedup-merged updated observation %s into %s (cosine>=%.2f)",
+            updated_id[:8],
+            outcome.best_id[:8],
+            config.consolidation_dedup_threshold,
+        )
         return
 
-    # Fold the updated observation's live sources into the twin (keeping the twin's embedding, as
-    # in the create path) then delete the now-redundant updated row. The all_strict/any tag match
-    # guarantees twin and updated share scope, so dropping the updated row's tags loses no
-    # visibility. Temporal fields follow the surviving twin (minimal scope; matches create).
-    # The fold + delete share one short transaction so the twin gains the sources exactly as the
-    # redundant row is removed; the slow adjudication above already ran connection-free.
-    store = get_memories()
-    async with acquire_with_retry(pool) as conn:
-        async with conn.transaction():
-            if store.writes_memory_rows_in_sql_for(bank_id):
-                # Snapshot the updated row's sources with a PLAIN read (no FOR UPDATE). Lock order
-                # must be sources-before-observation: _filter_live_source_memories below takes
-                # FOR SHARE on the SOURCE rows first, then the fold UPDATE locks the observation
-                # rows -- the same order as _dedup_reconcile_create and the normal write paths
-                # (_create_observation_directly / _execute_update_action). Locking the observation
-                # here (FOR UPDATE) would invert that against the invalidation path and deadlock.
-                updated_row = await conn.fetchrow(
-                    f"""
-                    SELECT source_memory_ids
-                    FROM {fq_table("memory_units")}
-                    WHERE id = $1::uuid AND text = $2
-                    """,
-                    uuid.UUID(updated_id),
-                    updated_text,
-                )
-                if updated_row is None:
-                    return
-                live_u_sources = await _filter_live_source_memories(
-                    conn, bank_id, list(updated_row["source_memory_ids"] or [])
-                )
-                if not live_u_sources:
-                    return
-                # Oracle-safe search_vector clause (#3021): "" unless a native PG tsvector column.
-                # RETURNING-gate on both rows' probe-time text so a survivor/updated rewrite during
-                # the connection-free LLM window can't be clobbered or fold a stale row.
-                search_vector_clause = _native_search_vector_update(config, "$1")
-                folded = await conn.fetchval(
-                    f"""
-                    UPDATE {fq_table("memory_units")} t
-                    SET text = $1,
-                        source_memory_ids = (
-                            SELECT array_agg(DISTINCT e) FROM unnest(t.source_memory_ids || $6::uuid[]) e
-                        ),
-                        proof_count = (
-                            SELECT count(DISTINCT e) FROM unnest(t.source_memory_ids || $6::uuid[]) e
-                        ),
-                        updated_at = now(){search_vector_clause}
-                    FROM {fq_table("memory_units")} u
-                    WHERE t.id = $2::uuid AND u.id = $3::uuid AND t.text = $4 AND u.text = $5
-                    RETURNING t.id
-                    """,
-                    outcome.merged_text,
-                    uuid.UUID(outcome.best_id),
-                    uuid.UUID(updated_id),
-                    outcome.best_text,
-                    updated_text,
-                    live_u_sources,
-                )
-                if folded is None:
-                    # Twin or updated row vanished during the LLM window — keep the updated row
-                    # as a distinct observation instead of deleting it unfolded.
-                    return
-            else:
-                updated_obs = await store.get_memories(
-                    conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[updated_id]
-                )
-                updated_sources = list(updated_obs[0].source_memory_ids or []) if updated_obs else []
-                live_u_sources = await _filter_live_source_memories(conn, bank_id, updated_sources)
-                if not live_u_sources:
-                    return
-                await _reconcile_merge_via_store(
-                    store, conn, memory_engine, bank_id, outcome.best_id, outcome.merged_text, live_u_sources, txn=txn
-                )
-            await _execute_delete_action(conn, bank_id, updated_id, txn=txn)
-    logger.info(
-        "[CONSOLIDATION] dedup-merged updated observation %s into %s (cosine>=%.2f)",
-        updated_id[:8],
-        outcome.best_id[:8],
-        config.consolidation_dedup_threshold,
+    updated_obs = await store.get_memories(
+        conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[updated_id]
     )
-
-
+    updated_sources = list(updated_obs[0].source_memory_ids or []) if updated_obs else []
+    live_u_sources = await _filter_live_source_memories(conn, bank_id, updated_sources)
+    if not live_u_sources:
+        return
+    await _reconcile_merge_via_store(
+        store, conn, memory_engine, bank_id, outcome.best_id, outcome.merged_text, live_u_sources, txn=txn
+    )
+    await _execute_delete_action(conn, bank_id, updated_id, txn=txn)
 @dataclass
 class _BatchDeltas:
     """Per-LLM-batch deltas, merged into the job's running stats after dispatch.
@@ -1969,6 +2059,7 @@ async def _process_memory_batch(
     config: Any = None,
     obs_tags_override: list[str] | None = None,
     txn=None,
+    conn=None,
 ) -> tuple[list[dict[str, Any]], int, bool]:
     """
     Process a batch of memories in a single LLM call.
@@ -2098,10 +2189,11 @@ async def _process_memory_batch(
     )
 
     # Execute deletes first to free observation slots before creates consume them. Each delete
-    # is a single fast statement, so the whole loop shares one short-lived connection.
+    # is a single fast statement, so the whole loop shares one short-lived connection (or the
+    # caller-owned Phase-B connection when ``conn`` is given).
     deleted_count = 0
     if llm_result.deletes:
-        async with acquire_with_retry(pool) as conn:
+        async with _write_group(pool, conn) as conn:
             for delete in llm_result.deletes:
                 # Security: the observation must be present in the unioned recall
                 if not any(str(obs.id) == delete.observation_id for obs in union_observations):
@@ -2139,6 +2231,7 @@ async def _process_memory_batch(
             source_mentioned_at=agg.mentioned_at,
             perf=perf,
             txn=txn,
+            conn=conn,
         )
         for m in source_mems:
             per_memory_updated.add(str(m["id"]))
@@ -2229,6 +2322,7 @@ async def _process_memory_batch(
             mentioned_at=agg.mentioned_at,
             perf=perf,
             txn=txn,
+            conn=conn,
         )
         # Count a memory as created only when an observation was actually written (the
         # source-liveness recheck inside the write txn can skip it connection-free).
@@ -2343,6 +2437,7 @@ async def _execute_update_action(
     source_mentioned_at: datetime | None = None,
     perf: ConsolidationPerfLog | None = None,
     txn=None,
+    conn=None,
 ) -> str | None:
     """
     Update an existing observation.
@@ -2356,6 +2451,11 @@ async def _execute_update_action(
 
     Returns the observation's freshly-computed embedding (pgvector literal) so the caller can
     run UPDATE-path dedup without re-embedding, or None when the update was skipped.
+
+    ``conn``: when provided (Phase-B caller-owned mode) all writes run on it inside the
+    caller's write-group transaction; no transaction is opened here and no connection is
+    acquired. When omitted (serial path) a short-lived connection + transaction are opened
+    exactly as before.
     """
     model = next((m for m in observations if str(m.id) == observation_id), None)
     if not model:
@@ -2367,13 +2467,16 @@ async def _execute_update_action(
     # Preflight (non-locking, separate short-lived conn): if every source memory is already
     # gone, skip BEFORE the slow embed — restores the pre-refactor short-circuit so a no-op
     # update doesn't embed and a failing embedder doesn't raise where it used to skip.
-    async with acquire_with_retry(pool) as conn:
-        if not await _any_live_source_memory(conn, bank_id, source_memory_ids):
-            logger.debug(
-                f"Update skipped: all {len(source_memory_ids)} source memories for observation "
-                f"{observation_id} were deleted before embedding"
-            )
-            return None
+    # Skipped in caller-owned mode: Phase B re-validates source liveness fresh under the bank
+    # guard inside ``_write_group``, so a second preflight connection would only add lock traffic.
+    if conn is None:
+        async with acquire_with_retry(pool) as c:
+            if not await _any_live_source_memory(c, bank_id, source_memory_ids):
+                logger.debug(
+                    f"Update skipped: all {len(source_memory_ids)} source memories for observation "
+                    f"{observation_id} were deleted before embedding"
+                )
+                return None
 
     # Embed off-connection: the new text is known up front and does not depend on
     # any DB state, so the (slow) embedder runs before we touch the pool.
@@ -2387,130 +2490,129 @@ async def _execute_update_action(
     search_vector_clause = _native_search_vector_update(config, "$1")
     store = get_memories()
 
-    async with acquire_with_retry(pool) as conn:
-        async with conn.transaction():
-            # FOR SHARE liveness + the write share one tiny transaction so a concurrent
-            # delete cannot remove a source row between the check and the UPDATE.
-            live_source_memory_ids = await _filter_live_source_memories(conn, bank_id, source_memory_ids)
-            if not live_source_memory_ids:
+    async with _write_group(pool, conn) as conn:
+        # FOR SHARE liveness + the write share one tiny transaction so a concurrent
+        # delete cannot remove a source row between the check and the UPDATE.
+        live_source_memory_ids = await _filter_live_source_memories(conn, bank_id, source_memory_ids)
+        if not live_source_memory_ids:
+            logger.debug(
+                f"Update skipped: all {len(source_memory_ids)} source memories for observation "
+                f"{observation_id} were deleted concurrently"
+            )
+            return None
+        live_ids = live_source_memory_ids
+
+        history_entry = _ObservationHistorySnapshot(
+            previous_text=model.text,
+            previous_tags=list(model.tags or []),
+            previous_occurred_start=model.occurred_start,
+            previous_occurred_end=model.occurred_end,
+            previous_mentioned_at=model.mentioned_at,
+            new_source_memory_ids=[str(mid) for mid in live_ids],
+        )
+
+        source_ids = list(model.source_fact_ids or []) + live_ids
+
+        # SECURITY: Merge source fact's tags into existing observation tags so all contributors can see it
+        existing_tags = set(model.tags or [])
+        source_tags = set(source_fact_tags or [])
+        merged_tags = list(existing_tags | source_tags)
+
+        t0 = time.time()
+        if store.writes_memory_rows_in_sql_for(bank_id):
+            updated_rows = await conn.execute_rows_affected(
+                f"""
+                UPDATE {fq_table("memory_units")}
+                SET text = $1,
+                    embedding = $2::vector,
+                    source_memory_ids = $3,
+                    proof_count = $4,
+                    tags = $9,
+                    updated_at = now(),
+                    occurred_start = LEAST(occurred_start, COALESCE($6, occurred_start)),
+                    occurred_end = GREATEST(occurred_end, COALESCE($7, occurred_end)),
+                    mentioned_at = GREATEST(mentioned_at, COALESCE($8, mentioned_at)){search_vector_clause}
+                WHERE id = $5
+                """,
+                new_text,
+                embedding_str,
+                source_ids,
+                len(source_ids),
+                uuid.UUID(observation_id),
+                source_occurred_start,
+                source_occurred_end,
+                source_mentioned_at,
+                merged_tags,
+            )
+            # The source-liveness checks above guard the *source* memories; the
+            # observation row itself (WHERE id = $5) can still be invalidated/deleted
+            # concurrently, matching 0 rows. Bail out BEFORE the observation_history
+            # INSERT below — that INSERT carries an observation_id FK onto memory_units,
+            # so appending history for a now-missing row raises ForeignKeyViolationError,
+            # a non-retryable integrity failure that would fail the whole consolidation
+            # op for a row that simply no longer exists.
+            if updated_rows == 0:
                 logger.debug(
-                    f"Update skipped: all {len(source_memory_ids)} source memories for observation "
-                    f"{observation_id} were deleted concurrently"
+                    f"Update skipped: observation {observation_id} no longer exists "
+                    "(deleted/invalidated concurrently); not appending history"
                 )
                 return None
-            live_ids = live_source_memory_ids
-
-            history_entry = _ObservationHistorySnapshot(
-                previous_text=model.text,
-                previous_tags=list(model.tags or []),
-                previous_occurred_start=model.occurred_start,
-                previous_occurred_end=model.occurred_end,
-                previous_mentioned_at=model.mentioned_at,
-                new_source_memory_ids=[str(mid) for mid in live_ids],
+        else:
+            # Upsert overwrites the whole observation, so start from its current state (fetched
+            # from the store) and apply the same merge the SQL does — LEAST/GREATEST on the times
+            # — while preserving fields the update never touches (event_date, created_at).
+            current = await store.get_memories(
+                conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[observation_id]
+            )
+            cur = current[0] if current else None
+            await store.upsert_observation(
+                conn=conn,
+                bank_id=bank_id,
+                txn=txn,
+                record=FactRecord(
+                    unit_id=observation_id,
+                    text=new_text,
+                    embedding=embedding_str,
+                    fact_type="observation",
+                    tags=merged_tags,
+                    proof_count=len(source_ids),
+                    source_memory_ids=[str(s) for s in source_ids],
+                    event_date=cur.event_date if cur else None,
+                    occurred_start=_merge_min(model.occurred_start, source_occurred_start),
+                    occurred_end=_merge_max(model.occurred_end, source_occurred_end),
+                    mentioned_at=_merge_max(model.mentioned_at, source_mentioned_at),
+                    created_at=cur.created_at if cur else None,
+                ),
             )
 
-            source_ids = list(model.source_fact_ids or []) + live_ids
+        # Record the pre-update snapshot in the dedicated observation_history table
+        # (one row per change), then trim to the configured cap. History lived in a
+        # single unbounded JSONB column before; an often-reinforced observation grew
+        # it until it crossed Postgres's 256MB jsonb limit and got stuck.
+        if config.enable_observation_history:
+            await _append_observation_history(
+                conn, bank_id, observation_id, history_entry, config.observation_history_max_entries
+            )
 
-            # SECURITY: Merge source fact's tags into existing observation tags so all contributors can see it
-            existing_tags = set(model.tags or [])
-            source_tags = set(source_fact_tags or [])
-            merged_tags = list(existing_tags | source_tags)
-
-            t0 = time.time()
-            if store.writes_memory_rows_in_sql_for(bank_id):
-                updated_rows = await conn.execute_rows_affected(
+        # Sync observation_sources junction table (Oracle only — PG uses native array ops).
+        if memory_engine._backend.ops.uses_observation_sources_table:
+            obs_uuid = uuid.UUID(observation_id)
+            await conn.execute(
+                f"DELETE FROM {fq_table('observation_sources')} WHERE observation_id = $1",
+                obs_uuid,
+            )
+            if source_ids:
+                await conn.executemany(
                     f"""
-                    UPDATE {fq_table("memory_units")}
-                    SET text = $1,
-                        embedding = $2::vector,
-                        source_memory_ids = $3,
-                        proof_count = $4,
-                        tags = $9,
-                        updated_at = now(),
-                        occurred_start = LEAST(occurred_start, COALESCE($6, occurred_start)),
-                        occurred_end = GREATEST(occurred_end, COALESCE($7, occurred_end)),
-                        mentioned_at = GREATEST(mentioned_at, COALESCE($8, mentioned_at)){search_vector_clause}
-                    WHERE id = $5
+                    INSERT INTO {fq_table("observation_sources")} (observation_id, source_id)
+                    VALUES ($1, $2)
+                    ON CONFLICT (observation_id, source_id) DO NOTHING
                     """,
-                    new_text,
-                    embedding_str,
-                    source_ids,
-                    len(source_ids),
-                    uuid.UUID(observation_id),
-                    source_occurred_start,
-                    source_occurred_end,
-                    source_mentioned_at,
-                    merged_tags,
-                )
-                # The source-liveness checks above guard the *source* memories; the
-                # observation row itself (WHERE id = $5) can still be invalidated/deleted
-                # concurrently, matching 0 rows. Bail out BEFORE the observation_history
-                # INSERT below — that INSERT carries an observation_id FK onto memory_units,
-                # so appending history for a now-missing row raises ForeignKeyViolationError,
-                # a non-retryable integrity failure that would fail the whole consolidation
-                # op for a row that simply no longer exists.
-                if updated_rows == 0:
-                    logger.debug(
-                        f"Update skipped: observation {observation_id} no longer exists "
-                        "(deleted/invalidated concurrently); not appending history"
-                    )
-                    return None
-            else:
-                # Upsert overwrites the whole observation, so start from its current state (fetched
-                # from the store) and apply the same merge the SQL does — LEAST/GREATEST on the times
-                # — while preserving fields the update never touches (event_date, created_at).
-                current = await store.get_memories(
-                    conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[observation_id]
-                )
-                cur = current[0] if current else None
-                await store.upsert_observation(
-                    conn=conn,
-                    bank_id=bank_id,
-                    txn=txn,
-                    record=FactRecord(
-                        unit_id=observation_id,
-                        text=new_text,
-                        embedding=embedding_str,
-                        fact_type="observation",
-                        tags=merged_tags,
-                        proof_count=len(source_ids),
-                        source_memory_ids=[str(s) for s in source_ids],
-                        event_date=cur.event_date if cur else None,
-                        occurred_start=_merge_min(model.occurred_start, source_occurred_start),
-                        occurred_end=_merge_max(model.occurred_end, source_occurred_end),
-                        mentioned_at=_merge_max(model.mentioned_at, source_mentioned_at),
-                        created_at=cur.created_at if cur else None,
-                    ),
+                    [(obs_uuid, sid) for sid in dict.fromkeys(source_ids)],
                 )
 
-            # Record the pre-update snapshot in the dedicated observation_history table
-            # (one row per change), then trim to the configured cap. History lived in a
-            # single unbounded JSONB column before; an often-reinforced observation grew
-            # it until it crossed Postgres's 256MB jsonb limit and got stuck.
-            if config.enable_observation_history:
-                await _append_observation_history(
-                    conn, bank_id, observation_id, history_entry, config.observation_history_max_entries
-                )
-
-            # Sync observation_sources junction table (Oracle only — PG uses native array ops).
-            if memory_engine._backend.ops.uses_observation_sources_table:
-                obs_uuid = uuid.UUID(observation_id)
-                await conn.execute(
-                    f"DELETE FROM {fq_table('observation_sources')} WHERE observation_id = $1",
-                    obs_uuid,
-                )
-                if source_ids:
-                    await conn.executemany(
-                        f"""
-                        INSERT INTO {fq_table("observation_sources")} (observation_id, source_id)
-                        VALUES ($1, $2)
-                        ON CONFLICT (observation_id, source_id) DO NOTHING
-                        """,
-                        [(obs_uuid, sid) for sid in dict.fromkeys(source_ids)],
-                    )
-
-            if perf:
-                perf.record_timing("db_write", time.time() - t0)
+        if perf:
+            perf.record_timing("db_write", time.time() - t0)
 
     # Map the updated observation onto the consolidation trace as a produced memory.
     record_created_memory_ids([observation_id])
@@ -2531,12 +2633,16 @@ async def _execute_create_action(
     mentioned_at: datetime | None = None,
     perf: ConsolidationPerfLog | None = None,
     txn=None,
+    conn=None,
 ) -> str:
     """
     Create a new observation from one or more source memories.
 
     Tags are inherited from the source facts (determined algorithmically, not by LLM)
     to maintain visibility scope. Returns the write action ("created" or "skipped").
+
+    ``conn``: when provided (Phase-B caller-owned mode) it is passed through to the
+    create write so the observation lands inside the caller's write-group transaction.
     """
     created = await _create_observation_directly(
         pool=pool,
@@ -2551,6 +2657,7 @@ async def _execute_create_action(
         mentioned_at=mentioned_at,
         perf=perf,
         txn=txn,
+        conn=conn,
     )
     # Map the new observation onto the consolidation trace as a produced memory.
     new_id = created.get("observation_id")
@@ -2558,6 +2665,25 @@ async def _execute_create_action(
         record_created_memory_ids([new_id])
     logger.debug(f"Created observation from {len(source_memory_ids)} source memories")
     return created["action"]
+
+
+async def _delete_observation_history(
+    conn: "Connection",
+    bank_id: str,
+    observation_id: str,
+) -> None:
+    """Drop an observation's history rows.
+
+    History lives in Postgres regardless of where the observation itself does, and no
+    longer cascades from memory_units (that FK was dropped so it could be recorded for
+    observations kept outside SQL). Dropped explicitly so a deleted observation's
+    snapshots don't accumulate forever.
+    """
+    await conn.execute(
+        f"DELETE FROM {fq_table('observation_history')} WHERE bank_id = $1 AND observation_id = $2",
+        bank_id,
+        uuid.UUID(observation_id),
+    )
 
 
 async def _execute_delete_action(
@@ -2576,15 +2702,7 @@ async def _execute_delete_action(
         )
     else:
         await store.delete_facts(bank_id, [observation_id], txn=txn)
-    # History lives in Postgres regardless of where the observation itself does, and no
-    # longer cascades from memory_units (that FK was dropped so it could be recorded for
-    # observations kept outside SQL). Drop it explicitly so a deleted observation's
-    # snapshots don't accumulate forever.
-    await conn.execute(
-        f"DELETE FROM {fq_table('observation_history')} WHERE bank_id = $1 AND observation_id = $2",
-        bank_id,
-        uuid.UUID(observation_id),
-    )
+    await _delete_observation_history(conn, bank_id, observation_id)
     logger.debug(f"Deleted observation {observation_id}")
 
 
@@ -2908,20 +3026,29 @@ async def _create_observation_directly(
     mentioned_at: datetime | None = None,
     perf: ConsolidationPerfLog | None = None,
     txn=None,
+    conn=None,
 ) -> dict[str, Any]:
     """Create an observation from one or more source memories with pre-processed text.
 
     The embedding is computed off-connection (a slow embedder must never pin a pooled
     connection); the liveness check + INSERT + observation_sources insert then run in one
     short transaction so they commit atomically.
+
+    ``conn``: when provided (Phase-B caller-owned mode) all writes run on it inside the
+    caller's write-group transaction; no transaction is opened here and no connection is
+    acquired. When omitted (serial path) a short-lived connection + transaction are opened
+    exactly as before.
     """
     # Preflight (non-locking, separate short-lived conn): if every source memory is already
     # gone, skip BEFORE the slow embed — restores the pre-refactor short-circuit so a no-op
     # create doesn't embed and a failing embedder doesn't raise where it used to skip.
-    async with acquire_with_retry(pool) as conn:
-        if not await _any_live_source_memory(conn, bank_id, source_memory_ids):
-            logger.debug(f"Create skipped: all {len(source_memory_ids)} source memories were deleted before embedding")
-            return {"action": "skipped", "reason": "sources_deleted"}
+    # Skipped in caller-owned mode: Phase B re-validates source liveness fresh under the bank
+    # guard inside ``_write_group``, so a second preflight connection would only add lock traffic.
+    if conn is None:
+        async with acquire_with_retry(pool) as c:
+            if not await _any_live_source_memory(c, bank_id, source_memory_ids):
+                logger.debug(f"Create skipped: all {len(source_memory_ids)} source memories were deleted before embedding")
+                return {"action": "skipped", "reason": "sources_deleted"}
 
     # Generate embedding for the observation (convert to string for pgvector) BEFORE
     # acquiring a connection so the embedder never holds a pooled connection.
@@ -2943,107 +3070,106 @@ async def _create_observation_directly(
     # search_vector the configured backend needs); a store that owns its rows takes it through
     # upsert_observation as a normal Observation-type memory carrying all of its own state.
     store = get_memories()
-    async with acquire_with_retry(pool) as conn:
-        async with conn.transaction():
-            # FOR SHARE liveness + INSERT share one tiny transaction so a concurrent
-            # delete cannot orphan the new observation between the check and the insert.
-            live_source_memory_ids = await _filter_live_source_memories(conn, bank_id, source_memory_ids)
-            if not live_source_memory_ids:
-                logger.debug(f"Create skipped: all {len(source_memory_ids)} source memories were deleted concurrently")
-                return {"action": "skipped", "reason": "sources_deleted"}
-            source_memory_ids = live_source_memory_ids
+    async with _write_group(pool, conn) as conn:
+        # FOR SHARE liveness + INSERT share one tiny transaction so a concurrent
+        # delete cannot orphan the new observation between the check and the insert.
+        live_source_memory_ids = await _filter_live_source_memories(conn, bank_id, source_memory_ids)
+        if not live_source_memory_ids:
+            logger.debug(f"Create skipped: all {len(source_memory_ids)} source memories were deleted concurrently")
+            return {"action": "skipped", "reason": "sources_deleted"}
+        source_memory_ids = live_source_memory_ids
 
-            t0 = time.time()
-            if store.writes_memory_rows_in_sql_for(bank_id):
-                # Query varies based on text search backend.
-                from ..schema import _is_oracle  # noqa: PLC0415
+        t0 = time.time()
+        if store.writes_memory_rows_in_sql_for(bank_id):
+            # Query varies based on text search backend.
+            from ..schema import _is_oracle  # noqa: PLC0415
 
-                config = get_config()
-                if config.text_search_extension == "vchord":
-                    # VectorChord: manually tokenize and insert search_vector
-                    query = f"""
-                        INSERT INTO {fq_table("memory_units")} (
-                            id, bank_id, text, fact_type, embedding, proof_count, source_memory_ids,
-                            tags, event_date, occurred_start, occurred_end, mentioned_at, search_vector
-                        )
-                        VALUES ($1, $2, $3, 'observation', $4::vector, 1, $5, $6, $7, $8, $9, $10,
-                                tokenize($3, 'llmlingua2')::bm25_catalog.bm25vector)
-                        RETURNING id
-                    """
-                elif config.text_search_extension == "native" and not _is_oracle():
-                    # Native (PostgreSQL): search_vector is populated with to_tsvector()
-                    # using the configured native language dictionary, matching the batch
-                    # insert path in ops_postgresql.insert_facts_batch. On Oracle this falls
-                    # through to the no-search_vector branch below (Oracle maintains its text
-                    # index separately; to_tsvector/::regconfig is PG-only — see #3021).
-                    query = f"""
-                        INSERT INTO {fq_table("memory_units")} (
-                            id, bank_id, text, fact_type, embedding, proof_count, source_memory_ids,
-                            tags, event_date, occurred_start, occurred_end, mentioned_at, search_vector
-                        )
-                        VALUES ($1, $2, $3, 'observation', $4::vector, 1, $5, $6, $7, $8, $9, $10,
-                                to_tsvector('{config.text_search_extension_native_language}'::regconfig, COALESCE($3, '')))
-                        RETURNING id
-                    """
-                else:  # pg_textsearch, pgroonga, pg_search, and Oracle: base text columns / separate index
-                    query = f"""
-                        INSERT INTO {fq_table("memory_units")} (
-                            id, bank_id, text, fact_type, embedding, proof_count, source_memory_ids,
-                            tags, event_date, occurred_start, occurred_end, mentioned_at
-                        )
-                        VALUES ($1, $2, $3, 'observation', $4::vector, 1, $5, $6, $7, $8, $9, $10)
-                        RETURNING id
-                    """
-
-                row = await conn.fetchrow(
-                    query,
-                    observation_id,
-                    bank_id,
-                    observation_text,
-                    embedding_str,
-                    source_memory_ids,
-                    obs_tags,
-                    obs_event_date,
-                    obs_occurred_start,
-                    obs_occurred_end,
-                    obs_mentioned_at,
-                )
-                created_id = row["id"]
-
-                # Populate observation_sources junction table (Oracle only — PG uses native array ops).
-                if memory_engine._backend.ops.uses_observation_sources_table and source_memory_ids:
-                    await conn.executemany(
-                        f"""
-                        INSERT INTO {fq_table("observation_sources")} (observation_id, source_id)
-                        VALUES ($1, $2)
-                        ON CONFLICT (observation_id, source_id) DO NOTHING
-                        """,
-                        [(observation_id, sid) for sid in dict.fromkeys(source_memory_ids)],
+            config = get_config()
+            if config.text_search_extension == "vchord":
+                # VectorChord: manually tokenize and insert search_vector
+                query = f"""
+                    INSERT INTO {fq_table("memory_units")} (
+                        id, bank_id, text, fact_type, embedding, proof_count, source_memory_ids,
+                        tags, event_date, occurred_start, occurred_end, mentioned_at, search_vector
                     )
-            else:
-                await store.upsert_observation(
-                    conn=conn,
-                    bank_id=bank_id,
-                    txn=txn,
-                    record=FactRecord(
-                        unit_id=str(observation_id),
-                        text=observation_text,
-                        embedding=embedding_str,
-                        fact_type="observation",
-                        tags=list(obs_tags),
-                        proof_count=1,
-                        source_memory_ids=[str(s) for s in source_memory_ids],
-                        event_date=obs_event_date,
-                        occurred_start=obs_occurred_start,
-                        occurred_end=obs_occurred_end,
-                        mentioned_at=obs_mentioned_at,
-                        created_at=now,
-                    ),
-                )
-                created_id = observation_id
+                    VALUES ($1, $2, $3, 'observation', $4::vector, 1, $5, $6, $7, $8, $9, $10,
+                            tokenize($3, 'llmlingua2')::bm25_catalog.bm25vector)
+                    RETURNING id
+                """
+            elif config.text_search_extension == "native" and not _is_oracle():
+                # Native (PostgreSQL): search_vector is populated with to_tsvector()
+                # using the configured native language dictionary, matching the batch
+                # insert path in ops_postgresql.insert_facts_batch. On Oracle this falls
+                # through to the no-search_vector branch below (Oracle maintains its text
+                # index separately; to_tsvector/::regconfig is PG-only — see #3021).
+                query = f"""
+                    INSERT INTO {fq_table("memory_units")} (
+                        id, bank_id, text, fact_type, embedding, proof_count, source_memory_ids,
+                        tags, event_date, occurred_start, occurred_end, mentioned_at, search_vector
+                    )
+                    VALUES ($1, $2, $3, 'observation', $4::vector, 1, $5, $6, $7, $8, $9, $10,
+                            to_tsvector('{config.text_search_extension_native_language}'::regconfig, COALESCE($3, '')))
+                    RETURNING id
+                """
+            else:  # pg_textsearch, pgroonga, pg_search, and Oracle: base text columns / separate index
+                query = f"""
+                    INSERT INTO {fq_table("memory_units")} (
+                        id, bank_id, text, fact_type, embedding, proof_count, source_memory_ids,
+                        tags, event_date, occurred_start, occurred_end, mentioned_at
+                    )
+                    VALUES ($1, $2, $3, 'observation', $4::vector, 1, $5, $6, $7, $8, $9, $10)
+                    RETURNING id
+                """
 
-            if perf:
-                perf.record_timing("db_write", time.time() - t0)
+            row = await conn.fetchrow(
+                query,
+                observation_id,
+                bank_id,
+                observation_text,
+                embedding_str,
+                source_memory_ids,
+                obs_tags,
+                obs_event_date,
+                obs_occurred_start,
+                obs_occurred_end,
+                obs_mentioned_at,
+            )
+            created_id = row["id"]
+
+            # Populate observation_sources junction table (Oracle only — PG uses native array ops).
+            if memory_engine._backend.ops.uses_observation_sources_table and source_memory_ids:
+                await conn.executemany(
+                    f"""
+                    INSERT INTO {fq_table("observation_sources")} (observation_id, source_id)
+                    VALUES ($1, $2)
+                    ON CONFLICT (observation_id, source_id) DO NOTHING
+                    """,
+                    [(observation_id, sid) for sid in dict.fromkeys(source_memory_ids)],
+                )
+        else:
+            await store.upsert_observation(
+                conn=conn,
+                bank_id=bank_id,
+                txn=txn,
+                record=FactRecord(
+                    unit_id=str(observation_id),
+                    text=observation_text,
+                    embedding=embedding_str,
+                    fact_type="observation",
+                    tags=list(obs_tags),
+                    proof_count=1,
+                    source_memory_ids=[str(s) for s in source_memory_ids],
+                    event_date=obs_event_date,
+                    occurred_start=obs_occurred_start,
+                    occurred_end=obs_occurred_end,
+                    mentioned_at=obs_mentioned_at,
+                    created_at=now,
+                ),
+            )
+            created_id = observation_id
+
+        if perf:
+            perf.record_timing("db_write", time.time() - t0)
 
     logger.debug(f"Created observation {observation_id} from {len(source_memory_ids)} memories (tags: {obs_tags})")
 
