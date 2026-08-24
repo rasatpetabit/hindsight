@@ -61,6 +61,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class UnsupportedConsolidationDialectError(RuntimeError):
+    """Store-CAS consolidation v1 is unavailable for this database dialect."""
+
+
 class _BatchStaleError(Exception):
     """Raised inside the Phase-B transaction when a prepared plan is stale under the guard.
 
@@ -1703,8 +1707,11 @@ async def run_consolidation_job(
     observation_scopes: list[list[str]] | None = None,
     pending_refresh_tags: list[str] | None = None,
 ) -> dict[str, Any]:
-    """
-    Run consolidation job for a bank.
+    """Run consolidation job for a bank.
+
+    Store-CAS consolidation v1 is implemented and proven only on PostgreSQL. Oracle is
+    rejected before bank config resolution, LLM setup, backend acquisition, or Phase A/B;
+    silently skipping would leave unconsolidated memories while appearing successful.
 
     This is called after retain operations to consolidate new memories into mental models.
 
@@ -1723,6 +1730,12 @@ async def run_consolidation_job(
     Returns:
         Dict with consolidation results
     """
+    database_backend = get_config().database_backend
+    if database_backend == "oracle":
+        raise UnsupportedConsolidationDialectError(
+            "Store-CAS consolidation v1 is PostgreSQL-only; Oracle consolidation is not supported"
+        )
+
     # Resolve bank-specific config with hierarchical overrides
     config = await memory_engine._config_resolver.resolve_full_config(bank_id, request_context)
 
