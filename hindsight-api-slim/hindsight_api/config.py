@@ -669,6 +669,7 @@ ENV_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS_PER_OBSERVATION = (
 )
 ENV_CONSOLIDATION_RECALL_BUDGET = "HINDSIGHT_API_CONSOLIDATION_RECALL_BUDGET"
 ENV_CONSOLIDATION_MAX_ATTEMPTS = "HINDSIGHT_API_CONSOLIDATION_MAX_ATTEMPTS"
+ENV_CONSOLIDATION_REPREPARE_ATTEMPTS = "HINDSIGHT_API_CONSOLIDATION_REPREPARE_ATTEMPTS"
 ENV_OBSERVATIONS_MISSION = "HINDSIGHT_API_OBSERVATIONS_MISSION"
 ENV_MAX_OBSERVATIONS_PER_SCOPE = "HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE"
 ENV_OBSERVATION_SCOPE_LIMITS = "HINDSIGHT_API_OBSERVATION_SCOPE_LIMITS"
@@ -1235,6 +1236,7 @@ DEFAULT_ENABLE_MENTAL_MODEL_HISTORY = True  # Mental model history tracking enab
 DEFAULT_MENTAL_MODEL_HISTORY_MAX_ENTRIES = 50
 DEFAULT_OBSERVATION_HISTORY_MAX_ENTRIES = 50
 DEFAULT_CONSOLIDATION_MAX_ATTEMPTS = 3  # Outer retry attempts for consolidation LLM batch calls
+DEFAULT_CONSOLIDATION_REPREPARE_ATTEMPTS = 1  # Extra Phase-A/B attempts for a stale batch (judge ruling 3); total attempts = 1 + this
 DEFAULT_CONSOLIDATION_BATCH_SIZE = 50  # Memories to load per batch (internal memory optimization)
 DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND = (
     100  # Max memories per consolidation round (0 = unlimited). Limits how long one bank holds a worker slot.
@@ -2456,6 +2458,10 @@ class HindsightConfig:
     consolidation_source_facts_max_tokens: int
     consolidation_source_facts_max_tokens_per_observation: int
     consolidation_max_attempts: int
+    # Bounded stale-reprepare budget (judge ruling 3): max full Phase-A/B retries after a
+    # stale Phase-B abort, within one LLM batch in one job. Total Phase-A executions per
+    # batch = 1 + this. 0 disables reprepare entirely.
+    consolidation_reprepare_attempts: int
     observations_mission: str | None
     max_observations_per_scope: int
     # Per-scope observation caps overriding max_observations_per_scope.
@@ -2735,6 +2741,7 @@ class HindsightConfig:
         "consolidation_max_memories_per_round",
         "consolidation_source_facts_max_tokens",
         "consolidation_source_facts_max_tokens_per_observation",
+        "consolidation_reprepare_attempts",
         "observations_mission",
         "max_observations_per_scope",
         "observation_scope_limits",
@@ -3749,6 +3756,9 @@ class HindsightConfig:
             ),
             consolidation_max_attempts=int(
                 os.getenv(ENV_CONSOLIDATION_MAX_ATTEMPTS, str(DEFAULT_CONSOLIDATION_MAX_ATTEMPTS))
+            ),
+            consolidation_reprepare_attempts=int(
+                os.getenv(ENV_CONSOLIDATION_REPREPARE_ATTEMPTS, str(DEFAULT_CONSOLIDATION_REPREPARE_ATTEMPTS))
             ),
             observations_mission=os.getenv(ENV_OBSERVATIONS_MISSION) or DEFAULT_OBSERVATIONS_MISSION,
             max_observations_per_scope=int(

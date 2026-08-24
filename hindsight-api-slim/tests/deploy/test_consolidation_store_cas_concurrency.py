@@ -194,7 +194,7 @@ async def test_crash_while_holding_bank_lock_recovers():
         await h.create_bank(bank_id)
         await h.seed_fact(bank_id, "Alpha runs nightly backups.")
 
-    holder_src = r'''
+    holder_src = r"""
 import asyncio, os, sys, asyncpg
 url, bank_id = sys.argv[1], sys.argv[2]
 async def main():
@@ -204,7 +204,7 @@ async def main():
             "SELECT bank_id FROM banks WHERE bank_id = $1 FOR UPDATE", bank_id)
         os._exit(86)  # die WITH the lock held and txn open; PG rolls back on close
 asyncio.run(main())
-'''
+"""
     p = subprocess.Popen(
         [sys.executable, "-c", holder_src, _URL, bank_id],
         stdout=subprocess.DEVNULL,
@@ -239,7 +239,7 @@ async def test_sql_crash_atomicity_zero_trace():
         await h.create_bank(bank_id)
         src = await h.seed_fact(bank_id, "Delta handles all API traffic.")
 
-    crash_src = r'''
+    crash_src = r"""
 import asyncio, os, sys, uuid, asyncpg
 from datetime import datetime, timezone
 url, bank_id = sys.argv[1], sys.argv[2]
@@ -266,7 +266,7 @@ async def main():
         # no commit — hard exit now (witness never persisted either)
         os._exit(87)
 asyncio.run(main())
-'''
+"""
     p = subprocess.Popen(
         [sys.executable, "-c", crash_src, _URL, bank_id],
         stdout=subprocess.DEVNULL,
@@ -399,9 +399,9 @@ async def test_terminal_fate_partition_disjoint():
         assert ok_state["consolidated_at"] is not None and ok_state["failed_at"] is None, ok_state
         assert fail_state["failed_at"] is not None or fail_state["consolidated_at"] is not None, fail_state
         # Terminal fate partition: a source is never in BOTH success and failed at once.
-        assert not (
-            fail_state.get("consolidated_at") is not None and fail_state.get("failed_at") is not None
-        ), f"terminal fate overlap on one source: {fail_state}"
+        assert not (fail_state.get("consolidated_at") is not None and fail_state.get("failed_at") is not None), (
+            f"terminal fate overlap on one source: {fail_state}"
+        )
 
         # Observation only exists on the success side.
         assert len(await h.observations(ok_bank)) == 1
@@ -474,8 +474,6 @@ async def test_user_mutation_caught_by_lock_or_cas():
         assert obs_now[obs_id]["text"].strip(), "observation text empty after consolidation"
 
 
-
-
 # ---------------------------------------------------------------------------
 # 12. Measured Phase-A overlap via barriers (not wall-clock)
 # ---------------------------------------------------------------------------
@@ -506,12 +504,16 @@ async def test_phase_a_overlap_measured():
             ):
                 await conn.execute(
                     f"""
-                    INSERT INTO {fq_table('memory_units')}
+                    INSERT INTO {fq_table("memory_units")}
                         (id, bank_id, text, fact_type, embedding, tags, observation_scopes)
                     VALUES ($1,$2,$3,'experience',$4::vector,$5,$6::jsonb)
                     """,
-                    str(uuid.uuid4()), bank_id, text, emb,
-                    [tag], json.dumps([[tag]]),
+                    str(uuid.uuid4()),
+                    bank_id,
+                    text,
+                    emb,
+                    [tag],
+                    json.dumps([[tag]]),
                 )
 
         # Barrier: both groups must reach it -> both entered Phase A concurrently.
@@ -894,3 +896,488 @@ async def test_stale_batch_aborts_txn_not_publishes():
 
         # Zero observations survive the abort path.
         assert len(await h.observations(bank_id)) == 0
+
+
+# ---------------------------------------------------------------------------
+# Ruling 2: bounded semantic candidate-set revalidation (different-source twin)
+# ---------------------------------------------------------------------------
+
+
+def _vec(value: float, dim: int = 384) -> str:
+    """A pgvector string of all-`value` entries (cosine with another all-`value` vec = 1.0)."""
+    return "[" + ",".join(str(value) for _ in range(dim)) + "]"
+
+
+async def _seed_observation_custom(
+    h,
+    bank_id: str,
+    text: str,
+    source_ids: list[str],
+    *,
+    tags: list[str] | None = None,
+    embedding_str: str | None = None,
+) -> str:
+    """Seed an observation row with an explicit embedding (for semantic-twin tests)."""
+    from datetime import datetime, timezone
+
+    from hindsight_api.engine.memory_engine import fq_table
+
+    obs_id = str(uuid.uuid4())
+    emb = embedding_str or _vec(0.2)
+    async with h.pool.acquire() as conn:
+        await conn.execute(
+            f"""
+            INSERT INTO {fq_table("memory_units")}
+                (id, bank_id, text, fact_type, embedding, event_date,
+                 source_memory_ids, proof_count, tags)
+            VALUES ($1,$2,$3,'observation',$4::vector,$5,$6::uuid[],$7,$8)
+            """,
+            obs_id,
+            bank_id,
+            text,
+            emb,
+            datetime.now(timezone.utc),
+            [uuid.UUID(s) for s in source_ids],
+            len(source_ids),
+            tags or [],
+        )
+    return obs_id
+
+
+# A fixed vocabulary used by _text_aware_embed so token -> index is stable across the
+# CREATE probe and the seeded observations (both must hash identically).
+_SEM_VOCAB = [
+    "alpha",
+    "ships",
+    "daily",
+    "deploys",
+    "on",
+    "friday",
+    "beta",
+    "releases",
+    "software",
+    "every",
+    "week",
+    "gamma",
+    "staging",
+    "monday",
+    "nightly",
+    "builds",
+    "delta",
+    "patches",
+    "production",
+    "hotfixes",
+    "quarterly",
+]
+
+
+async def _text_aware_embed(embeddings_obj, texts, **kwargs):
+    """Deterministic text-aware embedding for semantic tests.
+
+    Each text is encoded as a normalized bag-of-words vector over ``_SEM_VOCAB``:
+    near-twin texts (same tokens) land at cosine ~1.0 (> the 0.97 dedup threshold);
+    unrelated texts share no tokens and land far below it. Async to match the real
+    ``generate_embeddings_batch`` (callers await it).
+    """
+    vocab_index = {w: i for i, w in enumerate(_SEM_VOCAB)}
+    out = []
+    for t in texts:
+        vec = [0.0] * len(_SEM_VOCAB)
+        for w in set(t.strip().lower().split()):
+            idx = vocab_index.get(w)
+            if idx is not None:
+                vec[idx] += 1.0
+        norm = sum(v * v for v in vec) ** 0.5 or 1.0
+        base = [v / norm for v in vec]
+        padded = base + [0.0] * (384 - len(base))
+        out.append("[" + ",".join(f"{v:.6f}" for v in padded) + "]")
+    return out
+
+
+async def test_new_twin_invalidates_create_plan_semantic_different_source(tmp_path):
+    """Ruling 2: a semantic twin from a DIFFERENT source (no source-ID overlap) aborts.
+
+    Source A feeds a prepared CREATE; a concurrent observation referencing source B only
+    (no ID overlap) has near-identical semantic text above threshold. The under-guard
+    bounded pgvector lookup must detect the fresh in-scope candidate that was NOT in the
+    Phase-A snapshot and abort the whole batch with zero writes — never duplicating the
+    twin. The reprepare's Phase A then folds A into the survivor (union lineage).
+    """
+    import hindsight_api.engine.consolidation.consolidator as C
+
+    real_embed = C.embedding_utils.generate_embeddings_batch
+    try:
+        async with _harness() as h:
+            # Install the text-aware embedder AFTER the harness enters (its __aenter__
+            # reinstalls constant fake embeddings and would otherwise clobber it).
+            C.embedding_utils.generate_embeddings_batch = _text_aware_embed
+            bank_id = unique_bank("sem-twin-diff-src")
+            await h.create_bank(bank_id)
+            src_a = await h.seed_fact(bank_id, "Alpha ships daily deploys on friday.")
+            src_b = await h.seed_fact(bank_id, "Beta releases software every week.")
+
+            # Near-twin observation of what src_a will create, referencing ONLY src_b.
+            twin_text = "Alpha ships daily deploys on friday."
+            twin_emb = (await _text_aware_embed(None, [twin_text]))[0]
+            twin_id = await _seed_observation_custom(
+                h, bank_id, twin_text, [src_b], tags=["harness:pi", "proj:one"], embedding_str=twin_emb
+            )
+            # Mark the twin's own source consumed so consolidation only processes src_a
+            # (the twin is a pre-existing observation, not a pending source).
+            await h.mark_source(bank_id, src_b)
+
+            # Hide the twin from Phase-A recall on EVERY attempt: otherwise the
+            # deterministic verbatim-duplicate guard in ``_prepare_memory_batch`` drops the
+            # CREATE before dedup adjudication ever runs (verbatim text match), which would
+            # bypass Ruling 2 entirely. With it hidden, the CREATE is planned normally and the
+            # under-guard semantic lookup is what must detect the freshly-introduced twin.
+            from hindsight_api.engine.memories import get_memories
+
+            store = get_memories()
+            real_recall = store.recall_unified
+
+            async def _hide_twin_recall(*args, **kwargs):
+                res = await real_recall(*args, **kwargs)
+                if "observation" in res:
+                    obs_res = res["observation"]
+                    obs_res.semantic = [r for r in obs_res.semantic if str(getattr(r, "id", "")) != twin_id]
+                return res
+
+            store.recall_unified = _hide_twin_recall
+
+            # Control the Phase-A dedup adjudication deterministically with a single counter:
+            #  - first adjudication (attempt 1): pretend NO in-scope candidate (empty snapshot)
+            #    so the under-guard lookup is the ONLY thing that can detect the twin;
+            #  - reprepare adjudication (attempt 2): merge into the twin survivor.
+            real_adjudicate = C._dedup_adjudicate
+            adj_calls = [0]
+
+            async def _controlled_adjudicate(
+                pool,
+                memory_engine,
+                bank_id,
+                config,
+                dedup_llm_config,
+                anchor_text,
+                anchor_emb_str,
+                tags,
+                exclude_id,
+            ):
+                adj_calls[0] += 1
+                if adj_calls[0] == 1:
+                    # Attempt-1 Phase A: empty candidate snapshot -> the twin looks new to the
+                    # under-guard lookup, which must detect it and abort the whole batch.
+                    return C._DedupOutcome(best_id=None, merged_text="", should_merge=False)
+                # Reprepare Phase A: fold src_a into the twin survivor. Include the twin in
+                # the candidate snapshot so the under-guard lookup does not re-abort attempt 2.
+                return C._DedupOutcome(
+                    best_id=twin_id,
+                    merged_text=twin_text,
+                    should_merge=True,
+                    best_text=twin_text,
+                    candidate_ids={twin_id},
+                )
+
+            C._dedup_adjudicate = _controlled_adjudicate
+            try:
+                result = await h.consolidate(bank_id)
+            finally:
+                store.recall_unified = real_recall
+                C._dedup_adjudicate = real_adjudicate
+
+            # Exactly ONE observation survives; survivor lineage unions A and B.
+            obs = await h.observations(bank_id)
+            assert len(obs) == 1, f"semantic twin must fold into survivor; got {len(obs)} obs"
+            assert sorted(obs[0]["source_ids"]) == sorted([src_a, src_b]), obs[0]["source_ids"]
+            # Both sources consolidated (survivor is the union).
+            for sid in (src_a, src_b):
+                st = await h.source_state(bank_id, sid)
+                assert st["exists"] and st["consolidated_at"] is not None, f"{sid} not consolidated"
+    finally:
+        C.embedding_utils.generate_embeddings_batch = real_embed
+
+
+async def test_semantic_twin_detection_stale_exhausts_zero_writes(tmp_path):
+    """Ruling 2 detection + Ruling 3 cap: a persistent different-source semantic twin aborts.
+
+    When EVERY attempt's Phase-A hides the twin (so the candidate snapshot never contains
+    it), every under-guard lookup finds it as a fresh candidate -> every attempt stale ->
+    retry-exhausted with ZERO observations created and zero progress credit.
+    """
+    import hindsight_api.engine.consolidation.consolidator as C
+
+    real_embed = C.embedding_utils.generate_embeddings_batch
+    try:
+        async with _harness() as h:
+            # Install the text-aware embedder AFTER the harness enters (see above).
+            C.embedding_utils.generate_embeddings_batch = _text_aware_embed
+            bank_id = unique_bank("sem-twin-exhaust")
+            await h.create_bank(bank_id)
+            src_a = await h.seed_fact(bank_id, "Alpha ships daily deploys on friday.")
+            src_b = await h.seed_fact(bank_id, "Beta releases software every week.")
+
+            twin_text = "Alpha ships daily deploys on friday."
+            twin_emb = (await _text_aware_embed(None, [twin_text]))[0]
+            twin_id = await _seed_observation_custom(
+                h, bank_id, twin_text, [src_b], tags=["harness:pi", "proj:one"], embedding_str=twin_emb
+            )
+            # Mark the twin's own source consumed so consolidation only processes src_a.
+            await h.mark_source(bank_id, src_b)
+
+            from hindsight_api.engine.memories import get_memories
+
+            store = get_memories()
+            real_recall = store.recall_unified
+
+            async def _hide_twin_always(*args, **kwargs):
+                res = await real_recall(*args, **kwargs)
+                if "observation" in res:
+                    obs_res = res["observation"]
+                    obs_res.semantic = [r for r in obs_res.semantic if str(getattr(r, "id", "")) != twin_id]
+                return res
+
+            store.recall_unified = _hide_twin_always
+            try:
+                result = await h.consolidate(bank_id)
+            finally:
+                store.recall_unified = real_recall
+
+            # Zero observations created by consolidation; twin preserved.
+            obs = await h.observations(bank_id)
+            assert len(obs) == 1, f"must not duplicate the twin; got {len(obs)}"
+            assert sorted(obs[0]["source_ids"]) == sorted([src_b]), obs[0]["source_ids"]
+            # Source A stays unconsolidated+unfailed (retry-exhausted), never counted processed/failed.
+            sstate_a = await h.source_state(bank_id, src_a)
+            assert sstate_a["exists"] and sstate_a["consolidated_at"] is None
+            assert sstate_a["failed_at"] is None
+    finally:
+        C.embedding_utils.generate_embeddings_batch = real_embed
+
+
+async def test_semantic_twin_below_threshold_no_stale(tmp_path):
+    """Negative control: a distinct observation below threshold must NOT trigger stale retries.
+
+    An ordinary unrelated observation shares no tokens with the CREATE; the under-guard
+    lookup finds no fresh above-threshold candidate -> consolidation proceeds normally and
+    creates its own observation on the first attempt.
+    """
+    import hindsight_api.engine.consolidation.consolidator as C
+
+    real_embed = C.embedding_utils.generate_embeddings_batch
+    try:
+        async with _harness() as h:
+            # Install the text-aware embedder AFTER the harness enters (see above).
+            C.embedding_utils.generate_embeddings_batch = _text_aware_embed
+            bank_id = unique_bank("sem-twin-below")
+            await h.create_bank(bank_id)
+            src_a = await h.seed_fact(bank_id, "Alpha ships daily deploys on friday.")
+            other_b = await h.seed_fact(bank_id, "Delta patches production hotfixes quarterly.")
+
+            # Unrelated observation (shares no tokens -> below threshold).
+            other_text = "Delta patches production hotfixes quarterly."
+            other_emb = (await _text_aware_embed(None, [other_text]))[0]
+            await _seed_observation_custom(
+                h, bank_id, other_text, [other_b], tags=["harness:pi", "proj:one"], embedding_str=other_emb
+            )
+            # Mark the unrelated observation's own source consumed so consolidation only
+            # processes src_a (this is the negative control for the semantic lookup).
+            await h.mark_source(bank_id, other_b)
+
+            result = await h.consolidate(bank_id)
+
+            # Consolidation succeeded; a new observation for src_a was created (no endless retry).
+            obs = await h.observations(bank_id)
+            assert len(obs) == 2, f"expected own observation + unrelated one; got {len(obs)}"
+    finally:
+        C.embedding_utils.generate_embeddings_batch = real_embed
+
+
+# ---------------------------------------------------------------------------
+# Ruling 3: bounded reprepare — one immediate retry outside the lock
+# ---------------------------------------------------------------------------
+
+
+async def test_reprepare_stale_once_then_success(tmp_path):
+    """Ruling 3: first guard entry stale -> bounded reprepare -> second attempt commits.
+
+    Prevalidation returns stale on the FIRST attempt only; after re-fetching sources fresh
+    and re-running Phase A outside the lock, the second attempt prevalidates clean and
+    commits exactly one observation with zero leftovers.
+    """
+    from unittest.mock import patch
+
+    import hindsight_api.engine.consolidation.consolidator as C
+
+    async with _harness() as h:
+        bank_id = unique_bank("reprepare-once")
+        await h.create_bank(bank_id)
+        src = await h.seed_fact(bank_id, "Echo tracks all release trains.")
+
+        calls = [0]
+        real_prevalidate = C._prevalidate_prepared_batch
+
+        async def _stale_once(prepared, conn, bank_id):
+            calls[0] += 1
+            if calls[0] == 1:
+                return "create_stale:source_consumed:synthetic"
+            return await real_prevalidate(prepared=prepared, conn=conn, bank_id=bank_id)
+
+        with patch.object(C, "_prevalidate_prepared_batch", new=_stale_once):
+            result = await h.consolidate(bank_id)
+
+        # Exactly one observation survived; source consolidated.
+        obs = await h.observations(bank_id)
+        assert len(obs) == 1, f"reprepare must fold into survivor; got {len(obs)}"
+        sstate = await h.source_state(bank_id, src)
+        assert sstate["exists"] and sstate["consolidated_at"] is not None
+
+
+async def test_reprepare_executes_twice_and_no_busy_loop(tmp_path):
+    """Ruling 3 retry cap + no busy loop: persistent staleness exhausts then stops.
+
+    1) Phase A runs exactly twice total (initial + one reprepare) when always-stale;
+    2) zero observations written;
+    3) sources stay unconsolidated+unfailed;
+    4) the job returns without immediately re-fetching exhausted sources (no busy loop).
+    """
+    from unittest.mock import patch
+
+    import hindsight_api.engine.consolidation.consolidator as C
+
+    async with _harness() as h:
+        bank_id = unique_bank("reprepare-cap")
+        await h.create_bank(bank_id)
+        srcs = [await h.seed_fact(bank_id, f"Fact about item {i}.") for i in range(3)]
+
+        prepare_calls = [0]
+        orig_prepare = C._prepare_memory_batch
+
+        async def _counting_prepare(
+            pool=None,
+            memory_engine=None,
+            llm_config=None,
+            bank_id=None,
+            memories=None,
+            request_context=None,
+            perf=None,
+            config=None,
+            obs_tags_override=None,
+        ):
+            prepare_calls[0] += 1
+            return await orig_prepare(
+                pool=pool,
+                memory_engine=memory_engine,
+                llm_config=llm_config,
+                bank_id=bank_id,
+                memories=memories,
+                request_context=request_context,
+                perf=perf,
+                config=config,
+                obs_tags_override=obs_tags_override,
+            )
+
+        async def _always_stale(prepared, conn, bank_id):
+            return "create_stale:source_consumed:synthetic"
+
+        with (
+            patch.object(C, "_prevalidate_prepared_batch", new=_always_stale),
+            patch.object(C, "_prepare_memory_batch", new=_counting_prepare),
+        ):
+            result = await h.consolidate(bank_id)
+
+        # Phase A ran a BOUNDED number of times: initial attempt + exactly ONE reprepare
+        # (never endless). With 3 untagged sources sharing one sub-batch that is 2 calls;
+        # adaptive LLM splitting may add a few more, but never an unbounded retry storm.
+        assert 2 <= prepare_calls[0] <= 8, (
+            f"Phase A must be bounded (initial + one reprepare); saw {prepare_calls[0]} calls"
+        )
+        # Zero observations created by consolidation.
+        assert len(await h.observations(bank_id)) == 0
+        # Sources stay unconsolidated + unfailed (retry-exhausted).
+        for src in srcs:
+            sstate = await h.source_state(bank_id, src)
+            assert sstate["exists"] and sstate["consolidated_at"] is None and sstate["failed_at"] is None
+
+
+async def test_reprepare_runs_outside_lock(tmp_path):
+    """Ruling 3 off-lock retry: during reprepare Phase A the bank row lock is acquirable.
+
+    While the reprepare's Phase A runs (after a stale abort released the guard), another
+    connection can take the bank-row FOR UPDATE lock — proving slow work does not run under it.
+    """
+    from unittest.mock import patch
+
+    import hindsight_api.engine.consolidation.consolidator as C
+
+    async with _harness() as h:
+        bank_id = unique_bank("reprepare-off-lock")
+        await h.create_bank(bank_id)
+        src_a = await h.seed_fact(bank_id, "Foxtrot owns all nightly builds.")
+        src_b = await h.seed_fact(bank_id, "Golf publishes staging on monday.")
+
+        call_no = [0]
+        locked_during_reprepare: list[bool] = []
+        orig_prepare = C._prepare_memory_batch
+
+        async def _probing_prepare(
+            pool=None,
+            memory_engine=None,
+            llm_config=None,
+            bank_id=None,
+            memories=None,
+            request_context=None,
+            perf=None,
+            config=None,
+            obs_tags_override=None,
+        ):
+            call_no[0] += 1
+            if call_no[0] >= 2:
+                # During the reprepare's Phase A (attempt >= 2), probe whether the bank-row
+                # FOR UPDATE lock is free on a separate connection.
+                try:
+                    async with pool.acquire() as pc:
+                        async with pc.transaction():
+                            await pc.execute(
+                                f"SELECT bank_id FROM {C.fq_table('banks')} WHERE bank_id=$1 FOR UPDATE",
+                                bank_id,
+                            )
+                    locked_during_reprepare.append(False)
+                except Exception:
+                    locked_during_reprepare.append(True)
+                return await orig_prepare(
+                    pool=pool,
+                    memory_engine=memory_engine,
+                    llm_config=llm_config,
+                    bank_id=bank_id,
+                    memories=memories,
+                    request_context=request_context,
+                    perf=perf,
+                    config=config,
+                    obs_tags_override=obs_tags_override,
+                )
+            return await orig_prepare(
+                pool=pool,
+                memory_engine=memory_engine,
+                llm_config=llm_config,
+                bank_id=bank_id,
+                memories=memories,
+                request_context=request_context,
+                perf=perf,
+                config=config,
+                obs_tags_override=obs_tags_override,
+            )
+
+        async def _stale_first_two(prepared, conn, bank_id):
+            return "create_stale:source_consumed:synthetic"
+
+        # Force staleness on attempts so reprepare runs; every attempt stale -> exhausted but
+        # we only need ONE reprepare (attempt 2) to observe the lock probe.
+        with (
+            patch.object(C, "_prevalidate_prepared_batch", new=_stale_first_two),
+            patch.object(C, "_prepare_memory_batch", new=_probing_prepare),
+        ):
+            await h.consolidate(bank_id)
+
+        assert locked_during_reprepare and not any(locked_during_reprepare), (
+            f"bank lock must be free during reprepare Phase A; probe results={locked_during_reprepare}"
+        )

@@ -43,7 +43,7 @@ from ..llm_trace import (
     trace_context_of,
 )
 from ..llm_wrapper import sanitize_llm_output
-from ..memories import CASOutcome, FactRecord, get_memories
+from ..memories import CASOutcome, FactRecord, StoredMemory, get_memories
 from ..memory_engine import Budget, fq_table
 from ..retain import embedding_utils
 from .prompts import (
@@ -262,6 +262,11 @@ class _DedupOutcome:
 
     ``best_id`` is the nearest observation at/above the threshold (None if none),
     ``merged_text`` is the LLM-synthesized union text (set only when ``should_merge``).
+    ``candidate_ids`` records EVERY observation id probed during the Phase-A
+    adjudication (the bounded top-K, in scope) — the Phase-A candidate snapshot.
+    Ruling 2 re-checks this snapshot under the bank guard: if a fresh in-scope
+    candidate at/above threshold appears that was NOT probed here, the CREATE is
+    stale (a semantic twin was introduced during the LLM window).
     """
 
     best_id: str | None
@@ -270,6 +275,8 @@ class _DedupOutcome:
     # The twin's text at probe time. Guards the fold against a concurrent survivor
     # rewrite during the connection-free LLM window (set on the two non-None returns).
     best_text: str = ""
+    # Phase-A candidate snapshot (all probed ids, not just best).
+    candidate_ids: set[str] = field(default_factory=set)
 
 
 async def _dedup_adjudicate(
@@ -320,6 +327,12 @@ async def _dedup_adjudicate(
         temporal_window=None,
     )
     results = grouped["observation"].semantic
+    # Ruling 2: capture the Phase-A candidate snapshot — every observation id probed
+    # (the bounded in-scope top-K), so the under-guard re-check can detect a fresh
+    # semantic twin introduced during the LLM window.
+    candidate_ids: set[str] = set()
+    for r in results:
+        candidate_ids.add(str(r.id))
     best_id: str | None = None
     best_text = ""
     best_sim = threshold  # only candidates at/above the threshold are considered
@@ -332,7 +345,12 @@ async def _dedup_adjudicate(
             best_id, best_text, best_sim = rid, r.text, sim
 
     if best_id is None:
-        return _DedupOutcome(best_id=None, merged_text="", should_merge=False)
+        return _DedupOutcome(
+            best_id=None,
+            merged_text="",
+            should_merge=False,
+            candidate_ids=candidate_ids,
+        )
 
     decision = _dedup_decision_from_response(
         await dedup_llm_config.call(
@@ -343,9 +361,21 @@ async def _dedup_adjudicate(
         )
     )
     if decision.action != "merge":
-        return _DedupOutcome(best_id=best_id, merged_text="", should_merge=False, best_text=best_text)
+        return _DedupOutcome(
+            best_id=best_id,
+            merged_text="",
+            should_merge=False,
+            best_text=best_text,
+            candidate_ids=candidate_ids,
+        )
     merged_text = (sanitize_llm_output(decision.text) or "").strip() or best_text
-    return _DedupOutcome(best_id=best_id, merged_text=merged_text, should_merge=True, best_text=best_text)
+    return _DedupOutcome(
+        best_id=best_id,
+        merged_text=merged_text,
+        should_merge=True,
+        best_text=best_text,
+        candidate_ids=candidate_ids,
+    )
 
 
 async def _dedup_reconcile_create(
@@ -621,6 +651,10 @@ class _BatchDeltas:
     stats: dict[str, int]
     tags: set[str]
     cancelled: bool
+    # Ruling 3: memory ids whose batch exhausted its stale-reprepare budget this
+    # invocation. The outer loop must NOT immediately re-fetch them in the same job
+    # (no busy loop); they stay unconsolidated+unfailed for a LATER job invocation.
+    retry_exhausted_ids: set[str] = field(default_factory=set)
 
 
 
@@ -955,6 +989,11 @@ async def _prevalidate_prepared_batch(
         )
         if stale_reason != "ok":
             return f"create_stale:{stale_reason}"
+        # Ruling 2: bounded semantic candidate-set revalidation (fresh in-scope twin
+        # above threshold not in the Phase-A snapshot -> whole batch stale).
+        semantic_reason = await _semantic_candidate_expansion(conn, bank_id, pcreate)
+        if semantic_reason != "ok":
+            return f"create_semantic_stale:{semantic_reason}"
 
     for pupd in prepared.updates:
         # Target observation must still exist under the guard.
@@ -999,6 +1038,66 @@ async def _observation_exists(
         conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[observation_id]
     )
     return any(str(m.unit_id) == str(observation_id) for m in present)
+
+
+async def _semantic_candidate_expansion(
+    conn: "Connection",
+    bank_id: str,
+    pcreate: "_PreparedCreate",
+) -> str:
+    """Ruling 2: bounded semantic candidate-set revalidation under the bank guard.
+
+    Uses the ALREADY-COMPUTED Phase-A embedding (``pcreate.embedding_str``) — no
+    embedder/recall/LLM/reranker runs under the lock. Runs a bounded pgvector
+    similarity lookup over in-scope observations (same exact-scope/tag predicate
+    and threshold as the Phase-A dedup adjudication). If a fresh in-scope candidate
+    meets the threshold but was NOT in the Phase-A candidate snapshot, a semantic
+    twin was introduced during the LLM window: return a stale reason so the whole
+    batch aborts (Ruling 1). Phase B only DETECTS expansion and aborts — it never
+    decides a merge; the reprepare's Phase A does adjudication.
+
+    Returns ``"ok"`` or a short stale reason.
+    """
+    if not pcreate.embedding_str:
+        # No embedding (dedup disabled or embed failure): nothing to probe; the
+        # same-source containment query in ``_fresh_source_validation`` still guards
+        # the empty-snapshot race, and exact-text/lineage CAS still applies.
+        return "ok"
+    store = get_memories()
+    if not store.writes_memory_rows_in_sql_for(bank_id):
+        # Non-SQL store: no bounded pgvector lookup; its CAS seam provides the
+        # equivalent guard on fold/merge paths.
+        return "ok"
+    threshold = get_config().consolidation_dedup_threshold
+    tags = pcreate.agg.tags or []
+    # Same scope predicate as ``_dedup_adjudicate``: all_strict when the CREATE has
+    # tags (all must match), otherwise any observation is in scope.
+    if tags:
+        tags_clause = "tags @> $4::varchar[]"
+        limit_param = "$5"
+        tags_args: list[Any] = [tags]
+    else:
+        tags_clause = "TRUE"
+        limit_param = "$4"
+        tags_args = []
+    rows = await conn.fetch(
+        f"SELECT id FROM {fq_table('memory_units')}"
+        f" WHERE bank_id = $1 AND fact_type = 'observation' AND embedding IS NOT NULL"
+        f" AND (1 - (embedding <=> $2::vector)) >= $3"
+        f" AND {tags_clause}"
+        f" ORDER BY embedding <=> $2::vector LIMIT {limit_param}",
+        bank_id,
+        pcreate.embedding_str,
+        threshold,
+        *tags_args,
+        _DEDUP_TOP_K,
+    )
+    known = set(pcreate.candidate_ids)
+    fresh_hits = [str(r["id"]) for r in rows if str(r["id"]) not in known]
+    if fresh_hits:
+        return f"semantic_twin_new_candidate:{sorted(fresh_hits)[:5]}"
+    return "ok"
+
 
 
 class _CreateAction(BaseModel):
@@ -1088,6 +1187,10 @@ class _PreparedCreate:
     create_source_ids: list[uuid.UUID]
     dedup_outcome: "_DedupOutcome | None" = None
     embedding_str: str | None = None
+    # Ruling 2: Phase-A candidate snapshot — observation ids the dedup adjudication
+    # probed (in-scope bounded top-K). Re-checked under the bank guard so a fresh
+    # semantic twin above threshold aborts the batch instead of duplicating it.
+    candidate_ids: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -1460,6 +1563,63 @@ async def _fetch_unconsolidated_rows(
     ]
 
 
+async def _refetch_source_rows(
+    conn,
+    bank_id: str,
+    unit_ids: list[uuid.UUID],
+) -> list[dict[str, Any]]:
+    """Ruling 3: re-fetch original source rows FRESH by id for a bounded reprepare.
+
+    Returns the same row-dict shape :func:`_fetch_unconsolidated_rows` produces, but
+    reads by explicit unit ids (including already-consolidated rows, so the reprepare's
+    Phase A sees a consumed source as such rather than the stale pre-abort snapshot).
+    Missing ids are dropped (a deleted source can no longer be reprepared).
+    """
+    store = get_memories()
+    if not store.writes_memory_rows_in_sql_for(bank_id):
+        present = await store.get_memories(
+            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(uid) for uid in unit_ids]
+        )
+        by_id: dict[str, StoredMemory] = {str(m.unit_id): m for m in present}
+    else:
+        rows = await conn.fetch(
+            f"SELECT id, text, fact_type, event_date, occurred_start, occurred_end, mentioned_at,"
+            f" tags, observation_scopes FROM {fq_table('memory_units')}"
+            f" WHERE bank_id = $1 AND id = ANY($2::uuid[])",
+            bank_id,
+            list(unit_ids),
+        )
+        by_id = {
+            str(r["id"]): StoredMemory(
+                unit_id=str(r["id"]),
+                text=r["text"],
+                fact_type=r["fact_type"],
+                event_date=r["event_date"],
+                occurred_start=r["occurred_start"],
+                occurred_end=r["occurred_end"],
+                mentioned_at=r["mentioned_at"],
+                tags=list(r["tags"] or []),
+                observation_scopes=r["observation_scopes"],
+            )
+            for r in rows
+        }
+    return [
+        {
+            "id": uuid.UUID(str(m.unit_id)),
+            "text": m.text,
+            "fact_type": m.fact_type,
+            "occurred_start": m.occurred_start,
+            "occurred_end": m.occurred_end,
+            "event_date": m.event_date,
+            "tags": list(m.tags or []),
+            "mentioned_at": m.mentioned_at,
+            "observation_scopes": m.observation_scopes,
+        }
+        for uid in unit_ids
+        if (m := by_id.get(str(uid))) is not None
+    ]
+
+
 #: Cap on the store-side count of unconsolidated facts. Used only for the "is there work?"
 #: gate and progress reporting, so a floor at this size is harmless on a huge backlog.
 _COUNT_LIMIT = 100_000
@@ -1704,6 +1864,10 @@ async def _run_consolidation_job(
         "observations_deleted": 0,
         "memories_failed": 0,
     }
+    # Ruling 3: memory ids whose batch exhausted its stale-reprepare budget this job.
+    # Excluded from every subsequent fetch in this invocation (no busy loop); they stay
+    # unconsolidated+unfailed for a LATER job invocation.
+    retry_exhausted: set[str] = set()
     while True:
         # Cap fetch size by remaining round budget
         fetch_limit = (
@@ -1721,6 +1885,13 @@ async def _run_consolidation_job(
 
         if not memories:
             break  # No more unconsolidated memories
+
+        # Ruling 3 no-busy-loop: drop any batch whose stale-reprepare budget already
+        # exhausted this job so we never immediately re-fetch it in the same invocation.
+        memories = [m for m in memories if str(m["id"]) not in retry_exhausted]
+        if not memories:
+            break  # Nothing new left to try this invocation.
+
 
         # Group memories by exact tag set before batching — security requirement:
         # memories with different tags must never share an LLM call.
@@ -1768,6 +1939,14 @@ async def _run_consolidation_job(
               caller-owned write-group transaction, all prepared plans are committed via
               ``_commit_prepared_batch`` (fresh validation + CAS), then source marks,
               the witness row, and ``decide_txn`` all share that one transaction's fate.
+            * **Ruling 3 — bounded reprepare**: if Phase B aborts stale, the whole batch
+              re-fetches its sources FRESH and re-runs complete Phase A outside the lock,
+              then re-enters a fresh Phase-B transaction+guard. At most
+              ``config.consolidation_reprepare_attempts`` reprepares (total Phase-A runs =
+              1 + that). Exhausted batches stop in this job, leave sources
+              unconsolidated+unfailed, and are NOT counted processed/failed/skipped —
+              surfaced via ``retry_exhausted_ids`` so the outer loop never re-fetches them
+              in the same invocation (no busy loop).
             """
             llm_batch_start = time.time()
             batch_perf = ConsolidationPerfLog(bank_id)
@@ -1778,30 +1957,28 @@ async def _run_consolidation_job(
                 if memory_tags:
                     local_tags.update(memory_tags)
 
-            all_results: list[dict[str, Any]] = []
-            all_deleted = 0
-            succeeded_ids: list[Any] = []
-            failed_ids: list[Any] = []
-            stale_ids: set[str] = set()
-
-            # One cross-store write-group per LLM batch. For a separate-store backend the
-            # handle is minted once and tagged onto every observation write + mark; its witness
-            # row + decide happen inside the Phase-B transaction (below), so the group becomes
-            # visible atomically with the SQL commit. No Postgres transaction is held across any
-            # Phase-A work.
             _txn_provider = get_memories()
+            # One cross-store write-group per ATTEMPT. A stale abort publishes nothing; a
+            # reprepare mints a fresh handle for its own writes so an unpublished group is
+            # never carried forward.
             _batch_txn = await _txn_provider.mint_txn(bank_id=bank_id, mutating=True)
 
-            try:
-                # ---- Phase A: prepare all sub-batches × scopes (slow work, off-connection) ----
-                prepared_plans: list[_PreparedBatch] = []
-                pending: list[list[dict[str, Any]]] = [llm_batch_local]
+            reprepare_budget = int(getattr(config, "consolidation_reprepare_attempts", 1) or 0)
+            max_attempts = 1 + reprepare_budget
+
+            async def _prepare_once(source_batch: list[dict[str, Any]]) -> tuple[list["_PreparedBatch"], list[Any], list[Any], list[dict[str, Any]]]:
+                """Phase A for one attempt (off-connection): returns plans + source intent."""
+                plans: list["_PreparedBatch"] = []
+                succ: list[Any] = []
+                fail: list[Any] = []
+                results: list[dict[str, Any]] = []
+                pending: list[list[dict[str, Any]]] = [source_batch]
                 while pending:
                     sub_batch = pending.pop(0)
                     obs_tags_list = _resolve_obs_tags_list(sub_batch[0]) if sub_batch else None
 
                     sub_llm_failed = False
-                    sub_prepared: list[_PreparedBatch] = []
+                    sub_prepared: list["_PreparedBatch"] = []
                     if obs_tags_list:
                         for obs_tags in obs_tags_list:
                             prepared = await _prepare_memory_batch(
@@ -1839,126 +2016,187 @@ async def _run_consolidation_job(
                         )
                         pending[0:0] = [sub_batch[:mid], sub_batch[mid:]]
                     elif sub_llm_failed:
-                        failed_ids.append(sub_batch[0]["id"])
-                        all_results.append({"action": "failed"})
+                        fail.append(sub_batch[0]["id"])
+                        results.append({"action": "failed"})
                         logger.warning(
                             f"[CONSOLIDATION] bank={bank_id} LLM failed for single memory"
                             f" {sub_batch[0]['id']}, marking consolidation_failed_at"
                         )
                     else:
-                        prepared_plans.extend(sub_prepared)
+                        plans.extend(sub_prepared)
                         # A successfully-prepared sub-batch contributes every memory to the
                         # succeeded set (matching the original: only LLM failure keeps a memory
                         # unmarked / failed; skipped-but-prepared memories are still consolidated).
-                        succeeded_ids.extend(m["id"] for m in sub_batch)
+                        succ.extend(m["id"] for m in sub_batch)
+                return plans, succ, fail, results
 
-                # ---- Phase B: commit all prepared plans under ONE bank guard + txn ----
-                # When every sub-batch failed at the LLM (no plans) we still take the guard so
-                # the failed marks share one logical write-group fate with the witness.
-                store = get_memories()
-                now = datetime.now(timezone.utc)
-                batch_stale_reason: str | None = None
-                async with acquire_with_retry(pool) as conn:
-                    # The single bank-level commit guard (design §4.1): one FOR UPDATE row lock.
-                    # No lease table, no advisory lock — released by commit/rollback/teardown.
-                    try:
-                        async with conn.transaction():
-                            await conn.execute(
-                                f"SELECT bank_id FROM {fq_table('banks')} WHERE bank_id = $1 FOR UPDATE",
+            all_results: list[dict[str, Any]] = []
+            all_deleted = 0
+            succeeded_ids: list[Any] = []
+            failed_ids: list[Any] = []
+            stale_ids: set[str] = set()
+            retry_exhausted_ids: set[str] = set()
+            batch_stale_reason: str | None = None
+            current_source_batch: list[dict[str, Any]] = llm_batch_local
+
+            try:
+                for attempt in range(1, max_attempts + 1):
+                    if attempt > 1:
+                        # Ruling 3 reprepare: re-fetch the ORIGINAL source rows FRESH (outside any
+                        # lock/txn), then re-run complete Phase A off-connection.
+                        async with acquire_with_retry(pool) as rconn:
+                            current_source_batch = await _refetch_source_rows(
+                                rconn,
                                 bank_id,
+                                [uuid.UUID(str(m["id"])) for m in llm_batch_local],
                             )
-                            # Ruling 1: validation MUST precede mutation. Prevalidate every
-                            # prepared plan under the guard BEFORE any delete/update/create/
-                            # source-mark/witness executes. If any plan is stale, RAISE so the
-                            # ``async with conn.transaction()`` context manager rolls back the
-                            # ENTIRE Phase-B attempt — every write made by earlier plans included.
-                            # No marks/witness/refresh-tags/decide. We do NOT salvage the non-stale
-                            # subset into a partial commit.
-                            if prepared_plans:
+                        if not current_source_batch:
+                            logger.info(
+                                f"[CONSOLIDATION] bank={bank_id} llm_batch #{batch_num_local} reprepare:"
+                                f" all sources gone; leaving retry-exhausted"
+                            )
+                            retry_exhausted_ids.update(str(m["id"]) for m in llm_batch_local)
+                            break
+                        # Fresh write-group for this attempt's writes.
+                        try:
+                            await _txn_provider.decide_txn(_batch_txn, commit=False)
+                        except Exception:
+                            logger.warning(
+                                f"[CONSOLIDATION] bank={bank_id} failed to abort stale write-group"
+                                f" for llm_batch #{batch_num_local}; recovery sweep will resolve it",
+                                exc_info=True,
+                            )
+                        _batch_txn = await _txn_provider.mint_txn(bank_id=bank_id, mutating=True)
+
+                    # Reset per-attempt accumulators so a stale abort contributes nothing.
+                    all_results = []
+                    all_deleted = 0
+                    succeeded_ids = []
+                    failed_ids = []
+                    stale_ids = set()
+                    batch_stale_reason = None
+
+                    # ---- Phase A: prepare all sub-batches × scopes (slow work, off-connection) ----
+                    prepared_plans, succeeded_ids, failed_ids, all_results = await _prepare_once(current_source_batch)
+
+                    # ---- Phase B: commit all prepared plans under ONE bank guard + txn ----
+                    # When every sub-batch failed at the LLM (no plans) we still take the guard so
+                    # the failed marks share one logical write-group fate with the witness.
+                    store = get_memories()
+                    now = datetime.now(timezone.utc)
+                    async with acquire_with_retry(pool) as conn:
+                        # The single bank-level commit guard (design §4.1): one FOR UPDATE row lock.
+                        # No lease table, no advisory lock — released by commit/rollback/teardown.
+                        try:
+                            async with conn.transaction():
+                                await conn.execute(
+                                    f"SELECT bank_id FROM {fq_table('banks')} WHERE bank_id = $1 FOR UPDATE",
+                                    bank_id,
+                                )
+                                # Ruling 1: validation MUST precede mutation. Prevalidate every
+                                # prepared plan under the guard BEFORE any delete/update/create/
+                                # source-mark/witness executes. If any plan is stale, RAISE so the
+                                # ``async with conn.transaction()`` context manager rolls back the
+                                # ENTIRE Phase-B attempt — every write made by earlier plans included.
+                                # No marks/witness/refresh-tags/decide. We do NOT salvage the non-stale
+                                # subset into a partial commit.
+                                if prepared_plans:
+                                    for prepared in prepared_plans:
+                                        reason = await _prevalidate_prepared_batch(prepared=prepared, conn=conn, bank_id=bank_id)
+                                        if reason != "ok":
+                                            logger.warning(f"[CONSOLIDATION] bank={bank_id} Phase-B prevalidation stale ({reason}); aborting whole batch with zero writes")
+                                            raise _BatchStaleError(reason)
                                 for prepared in prepared_plans:
-                                    reason = await _prevalidate_prepared_batch(prepared=prepared, conn=conn, bank_id=bank_id)
-                                    if reason != "ok":
-                                        logger.warning(f"[CONSOLIDATION] bank={bank_id} Phase-B prevalidation stale ({reason}); aborting whole batch with zero writes")
-                                        raise _BatchStaleError(reason)
-                            for prepared in prepared_plans:
-                                presults, pdeleted, pstale = await _commit_prepared_batch(prepared=prepared, pool=pool, memory_engine=memory_engine, bank_id=bank_id, config=config, perf=batch_perf, txn=_batch_txn, conn=conn)
-                                if pstale:
-                                    # CAS stale during mutation (final safety net): earlier plans
-                                    # may already have written rows in THIS transaction; raising
-                                    # rolls them all back together (one-batch/one-fate).
-                                    logger.warning(f"[CONSOLIDATION] bank={bank_id} CAS stale during mutation ({sorted(pstale)[:5]}); aborting whole batch")
-                                    raise _BatchStaleError(f"cas_stale:{sorted(pstale)[:5]}")
-                                all_deleted += pdeleted
-                                stale_ids |= pstale
-                                if not all_results:
-                                    all_results.extend(presults)
-                                else:
-                                    if len(presults) != len(all_results):
+                                    presults, pdeleted, pstale = await _commit_prepared_batch(prepared=prepared, pool=pool, memory_engine=memory_engine, bank_id=bank_id, config=config, perf=batch_perf, txn=_batch_txn, conn=conn)
+                                    if pstale:
+                                        # CAS stale during mutation (final safety net): earlier plans
+                                        # may already have written rows in THIS transaction; raising
+                                        # rolls them all back together (one-batch/one-fate).
+                                        logger.warning(f"[CONSOLIDATION] bank={bank_id} CAS stale during mutation ({sorted(pstale)[:5]}); aborting whole batch")
+                                        raise _BatchStaleError(f"cas_stale:{sorted(pstale)[:5]}")
+                                    all_deleted += pdeleted
+                                    stale_ids |= pstale
+                                    if not all_results:
                                         all_results.extend(presults)
                                     else:
-                                        for i, (existing, new) in enumerate(zip(all_results, presults)):
-                                            if existing.get("action") == "skipped" and new.get("action") != "skipped":
-                                                all_results[i] = new
-                                            elif existing.get("action") != "skipped" and new.get("action") != "skipped":
-                                                existing_created = existing.get("created", 1 if existing.get("action") == "created" else 0)
-                                                existing_updated = existing.get("updated", 1 if existing.get("action") == "updated" else 0)
-                                                new_created = new.get("created", 1 if new.get("action") == "created" else 0)
-                                                new_updated = new.get("updated", 1 if new.get("action") == "updated" else 0)
-                                                total = existing_created + existing_updated + new_created + new_updated
-                                                all_results[i] = {"action": "multiple", "created": existing_created + new_created, "updated": existing_updated + new_updated, "merged": 0, "total_actions": total}
-                            # Only a fully-validated batch may be marked / witnessed / decided.
-                            # Marks+witness also run when there are no prepared plans but LLM
-                            # failures occurred (failed_ids) — the all-LLM-failed case still needs
-                            # its failed marks + witness to share one logical write-group fate.
-                            if prepared_plans or failed_ids:
-                                effective_succeeded = [mem_id for mem_id in succeeded_ids if str(mem_id) not in stale_ids]
-                                if effective_succeeded:
-                                    await store.mark_consolidated(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(mem_id) for mem_id in effective_succeeded], when=now, failed=False, txn=_batch_txn)
-                                if failed_ids:
-                                    await store.mark_consolidated(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(mem_id) for mem_id in failed_ids], when=now, failed=True, txn=_batch_txn)
-                                await _txn_provider.write_txn_witness(_batch_txn, conn=conn, fq_table=fq_table)
-                                # Persist this batch's mental-model refresh tags atomically with
-                                # the witness (#3411). Only succeeded sources contribute a tag.
-                                if operation_id and effective_succeeded:
-                                    succeeded_set = {str(mem_id) for mem_id in effective_succeeded}
-                                    batch_tags = sorted(
-                                        {
-                                            t
-                                            for m in llm_batch_local
-                                            if str(m["id"]) in succeeded_set
-                                            for t in (m.get("tags") or [])
-                                        }
-                                    )
-                                    if batch_tags:
-                                        await _persist_pending_refresh_tags(conn, operation_id, batch_tags)
-                    except _BatchStaleError as e:
-                        # The ``async with conn.transaction()`` rolled back every write made so
-                        # far (prevalidation-abort or mutation-CAS-abort). Discard buffered
-                        # results/deleted counters so the stale attempt contributes nothing.
-                        batch_stale_reason = e.reason
-                        all_results.clear()
-                        all_deleted = 0
+                                        if len(presults) != len(all_results):
+                                            all_results.extend(presults)
+                                        else:
+                                            for i, (existing, new) in enumerate(zip(all_results, presults)):
+                                                if existing.get("action") == "skipped" and new.get("action") != "skipped":
+                                                    all_results[i] = new
+                                                elif existing.get("action") != "skipped" and new.get("action") != "skipped":
+                                                    existing_created = existing.get("created", 1 if existing.get("action") == "created" else 0)
+                                                    existing_updated = existing.get("updated", 1 if existing.get("action") == "updated" else 0)
+                                                    new_created = new.get("created", 1 if new.get("action") == "created" else 0)
+                                                    new_updated = new.get("updated", 1 if new.get("action") == "updated" else 0)
+                                                    total = existing_created + existing_updated + new_created + new_updated
+                                                    all_results[i] = {"action": "multiple", "created": existing_created + new_created, "updated": existing_updated + new_updated, "merged": 0, "total_actions": total}
+                                # Only a fully-validated batch may be marked / witnessed / decided.
+                                # Marks+witness also run when there are no prepared plans but LLM
+                                # failures occurred (failed_ids) — the all-LLM-failed case still needs
+                                # its failed marks + witness to share one logical write-group fate.
+                                if prepared_plans or failed_ids:
+                                    effective_succeeded = [mem_id for mem_id in succeeded_ids if str(mem_id) not in stale_ids]
+                                    if effective_succeeded:
+                                        await store.mark_consolidated(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(mem_id) for mem_id in effective_succeeded], when=now, failed=False, txn=_batch_txn)
+                                    if failed_ids:
+                                        await store.mark_consolidated(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(mem_id) for mem_id in failed_ids], when=now, failed=True, txn=_batch_txn)
+                                    await _txn_provider.write_txn_witness(_batch_txn, conn=conn, fq_table=fq_table)
+                                    # Persist this batch's mental-model refresh tags atomically with
+                                    # the witness (#3411). Only succeeded sources contribute a tag.
+                                    if operation_id and effective_succeeded:
+                                        succeeded_set = {str(mem_id) for mem_id in effective_succeeded}
+                                        batch_tags = sorted(
+                                            {
+                                                t
+                                                for m in llm_batch_local
+                                                if str(m["id"]) in succeeded_set
+                                                for t in (m.get("tags") or [])
+                                            }
+                                        )
+                                        if batch_tags:
+                                            await _persist_pending_refresh_tags(conn, operation_id, batch_tags)
+                        except _BatchStaleError as e:
+                            # The ``async with conn.transaction()`` rolled back every write made so
+                            # far (prevalidation-abort or mutation-CAS-abort). Discard buffered
+                            # results/deleted counters so the stale attempt contributes nothing.
+                            batch_stale_reason = e.reason
+                            all_results.clear()
+                            all_deleted = 0
 
-                cancelled_local = False
-
-                if batch_stale_reason is not None:
-                    # Ruling 1: a stale batch rolled back with zero writes and no marks/witness.
-                    # Abort/unpublish the write-group (no committed fate) and give NO progress
-                    # credit — sources stay unconsolidated+unfailed and remain eligible for a
-                    # bounded reprepare outside the lock (Ruling 3). Neither processed/failed/
-                    # skipped may count this attempt.
-                    try:
-                        await _txn_provider.decide_txn(_batch_txn, commit=False)
-                    except Exception:
-                        logger.warning(
-                            f"[CONSOLIDATION] bank={bank_id} failed to abort write-group for stale"
-                            f" llm_batch #{batch_num_local}; recovery sweep will resolve it",
-                            exc_info=True,
+                    if batch_stale_reason is not None:
+                        # Ruling 1 + Ruling 3: a stale batch rolled back with zero writes and no marks/
+                        # witness. Abort/unpublish the write-group (no committed fate) and give NO
+                        # progress credit — sources stay unconsolidated+unfailed and remain eligible for
+                        # a bounded reprepare OUTSIDE the lock. If reprepare budget remains, loop back;
+                        # otherwise exhaust and stop this batch in this job.
+                        try:
+                            await _txn_provider.decide_txn(_batch_txn, commit=False)
+                        except Exception:
+                            logger.warning(
+                                f"[CONSOLIDATION] bank={bank_id} failed to abort write-group for stale"
+                                f" llm_batch #{batch_num_local}; recovery sweep will resolve it",
+                                exc_info=True,
+                            )
+                        logger.info(
+                            f"[CONSOLIDATION] bank={bank_id} llm_batch #{batch_num_local} aborted"
+                            f" stale (zero writes, no progress credit); reason={batch_stale_reason}"
                         )
-                    logger.info(
-                        f"[CONSOLIDATION] bank={bank_id} llm_batch #{batch_num_local} aborted"
-                        f" stale (zero writes, no progress credit); reason={batch_stale_reason}"
-                    )
+                        if attempt < max_attempts:
+                            continue  # bounded reprepare outside the lock (Ruling 3)
+                        retry_exhausted_ids.update(str(m["id"]) for m in llm_batch_local)
+                        break
+
+                    break  # success — no further attempts
+
+                if retry_exhausted_ids:
+                    # Ruling 3: this batch exhausted its stale-reprepare budget (or all its
+                    # sources vanished). Nothing committed on any attempt — every write was
+                    # rolled back stale or never attempted. Return zero-progress deltas plus
+                    # the exhausted ids so the outer loop never re-fetches them this job.
+                    # ``succeeded_ids``/``failed_ids`` hold Phase-A INTENT that is
+                    # re-populated even on stale attempts, so they must not gate this return.
                     return _BatchDeltas(
                         stats={
                             "memories_processed": 0,
@@ -1971,8 +2209,11 @@ async def _run_consolidation_job(
                             "memories_failed": 0,
                         },
                         tags=local_tags,
-                        cancelled=cancelled_local,
+                        cancelled=False,
+                        retry_exhausted_ids=retry_exhausted_ids,
                     )
+
+                cancelled_local = False
 
                 # ---- Post-commit bookkeeping (no writes on the guarded conn) ----
                 # Note: when prepared_plans was empty we still decide/abort the txn below.
@@ -2080,7 +2321,6 @@ async def _run_consolidation_job(
             await _txn_provider.decide_txn(_batch_txn, commit=True)
 
             return _BatchDeltas(stats=local_stats, tags=local_tags, cancelled=cancelled_local)
-
         # Number every batch up front so log line numbering is deterministic
         # regardless of dispatch order under parallelism. Each group keeps its own
         # (batch, number) list so it can be processed as one serial unit.
@@ -2146,6 +2386,7 @@ async def _run_consolidation_job(
             for k, v in d.stats.items():
                 stats[k] = stats.get(k, 0) + v
             consolidated_tags.update(d.tags)
+            retry_exhausted.update(d.retry_exhausted_ids)
 
         if any_cancelled:
             return {"status": "cancelled", "bank_id": bank_id, **stats}
@@ -2609,6 +2850,7 @@ async def _prepare_memory_batch(
             create_source_ids=create_source_ids,
             dedup_outcome=dedup_outcome,
             embedding_str=embedding_str,
+            candidate_ids=set(dedup_outcome.candidate_ids) if dedup_outcome is not None else set(),
         ))
 
     return _PreparedBatch(
