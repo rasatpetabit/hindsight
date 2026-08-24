@@ -668,8 +668,36 @@ def _batch_engine():
     return types.SimpleNamespace(_consolidation_llm_config=types.SimpleNamespace(with_config=lambda *a, **k: object()))
 
 
+class _FakePool:
+    """Backend-shaped stand-in for the serial path's ``acquire_with_retry``.
+
+    ``_wraps_backend = True`` routes through the DatabaseBackend branch of
+    ``acquire_with_retry`` (no pool-size introspection). The executors are mocked in
+    these tests, so the yielded conn only needs ``transaction()``.
+    """
+
+    _wraps_backend = True
+
+    @asynccontextmanager
+    async def acquire(self):
+        yield _FakeConn()
+
+
+class _FakeConn:
+    @asynccontextmanager
+    async def transaction(self):
+        yield self
+
+    async def execute(self, query, *args):
+        return None
+
+    async def fetchrow(self, query, *args):
+        return None
+
+
 async def _run_create_batch(create_action_result: str):
     from hindsight_api.engine.consolidation import consolidator as C
+    from hindsight_api.engine.consolidation.consolidator import _DedupOutcome
 
     mem_id = str(uuid.uuid4())
     memories = [{"id": mem_id, "text": "Uzbek YouTube content is very rich.", "tags": []}]
@@ -684,11 +712,17 @@ async def _run_create_batch(create_action_result: str):
         patch.object(C, "_consolidate_batch_with_llm", new=AsyncMock(return_value=llm_result)),
         patch.object(C, "_effective_scope_limit", return_value=-1),
         patch.object(C, "_dedup_active", return_value=True),
-        patch.object(C, "_dedup_reconcile_create", new=AsyncMock(return_value=None)),
+        # Phase A now pre-adjudicates CREATE dedup (design §4.2); a no-merge outcome sends
+        # the CREATE straight to _execute_create_action in Phase B.
+        patch.object(
+            C,
+            "_dedup_adjudicate",
+            new=AsyncMock(return_value=_DedupOutcome(best_id=None, merged_text="", should_merge=False)),
+        ),
         patch.object(C, "_execute_create_action", new=AsyncMock(return_value=create_action_result)) as create_action,
     ):
         result = await C._process_memory_batch(
-            pool=object(),
+            pool=_FakePool(),
             memory_engine=_batch_engine(),
             llm_config=object(),
             bank_id="bank1",
