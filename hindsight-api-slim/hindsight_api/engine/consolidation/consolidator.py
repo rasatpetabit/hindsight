@@ -43,7 +43,7 @@ from ..llm_trace import (
     trace_context_of,
 )
 from ..llm_wrapper import sanitize_llm_output
-from ..memories import CASOutcome, FactRecord, StoredMemory, get_memories
+from ..memories import CASOutcome, FactRecord, MemoryPatch, StoredMemory, get_memories
 from ..memory_engine import Budget, fq_table
 from ..retain import embedding_utils
 from .prompts import (
@@ -2922,6 +2922,7 @@ async def _commit_prepared_batch(
                 perf=perf,
                 txn=txn,
                 conn=wconn,
+                precomputed_embedding=pupd.embedding_str,
             )
             for m in pupd.source_mems:
                 per_memory_updated.add(str(m["id"]))
@@ -3182,6 +3183,7 @@ async def _execute_update_action(
     perf: ConsolidationPerfLog | None = None,
     txn=None,
     conn=None,
+    precomputed_embedding: str | None = None,
 ) -> str | None:
     """
     Update an existing observation.
@@ -3192,6 +3194,16 @@ async def _execute_update_action(
     The embedding is computed off-connection (a slow embedder must never pin a pooled
     connection); the liveness check + UPDATE + history + observation_sources sync then run
     in one short transaction so they commit atomically.
+
+    ``precomputed_embedding``: Phase-B caller-owned mode passes the embedding computed
+    in Phase A (design §4.2 — no embedder under the bank lock). When omitted (serial
+    path, or a non-parallel caller) the embedding is computed here off-connection exactly
+    as before.
+
+    Under the bank guard (Phase B) the target observation is snapshotted fresh and the row
+    update runs through the store CAS seam (``cas_update_memory``) gated on the expected
+    revision token; a concurrently-mutated/deleted target raises ``_BatchStaleError`` so the
+    whole original batch rolls back with zero writes (judge blocker 5, Ruling 1).
 
     Returns the observation's freshly-computed embedding (pgvector literal) so the caller can
     run UPDATE-path dedup without re-embedding, or None when the update was skipped.
@@ -3223,15 +3235,21 @@ async def _execute_update_action(
                 return None
 
     # Embed off-connection: the new text is known up front and does not depend on
-    # any DB state, so the (slow) embedder runs before we touch the pool.
+    # any DB state, so the (slow) embedder runs before we touch the pool. In Phase-B
+    # caller-owned mode the embedding was already computed in Phase A and is passed in —
+    # never run the slow embedder while holding the bank lock.
     t0 = time.time()
-    embeddings = await embedding_utils.generate_embeddings_batch(memory_engine.embeddings, [new_text])
-    embedding_str = str(embeddings[0]) if embeddings else None
-    if perf:
-        perf.record_timing("embedding", time.time() - t0)
+    if precomputed_embedding is not None:
+        embedding_str = precomputed_embedding
+        if perf:
+            perf.record_timing("embedding", 0.0)  # measured in Phase A; do not double-count under lock
+    else:
+        embeddings = await embedding_utils.generate_embeddings_batch(memory_engine.embeddings, [new_text])
+        embedding_str = str(embeddings[0]) if embeddings else None
+        if perf:
+            perf.record_timing("embedding", time.time() - t0)
 
     config = get_config()
-    search_vector_clause = _native_search_vector_update(config, "$1")
     store = get_memories()
 
     async with _write_group(pool, conn) as conn:
@@ -3264,43 +3282,65 @@ async def _execute_update_action(
 
         t0 = time.time()
         if store.writes_memory_rows_in_sql_for(bank_id):
-            updated_rows = await conn.execute_rows_affected(
-                f"""
-                UPDATE {fq_table("memory_units")}
-                SET text = $1,
-                    embedding = $2::vector,
-                    source_memory_ids = $3,
-                    proof_count = $4,
-                    tags = $9,
-                    updated_at = now(),
-                    occurred_start = LEAST(occurred_start, COALESCE($6, occurred_start)),
-                    occurred_end = GREATEST(occurred_end, COALESCE($7, occurred_end)),
-                    mentioned_at = GREATEST(mentioned_at, COALESCE($8, mentioned_at)){search_vector_clause}
-                WHERE id = $5
-                """,
-                new_text,
-                embedding_str,
-                source_ids,
-                len(source_ids),
-                uuid.UUID(observation_id),
-                source_occurred_start,
-                source_occurred_end,
-                source_mentioned_at,
-                merged_tags,
+            # Blocker 5 (judge 5f7f900d): the target observation must be mutated through the
+            # store CAS seam, never by an unconditional row update. Snapshot it fresh under the
+            # caller's transaction (bank -> observation lock order), then apply via
+            # ``cas_update_memory`` gated on the expected revision token. A concurrently-
+            # mutated/deleted target returns STALE/MISSING -> raise ``_BatchStaleError`` so the
+            # whole original batch rolls back with zero writes (Ruling 1).
+            snaps = await store.snapshot_memories(
+                conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[observation_id]
             )
-            # The source-liveness checks above guard the *source* memories; the
-            # observation row itself (WHERE id = $5) can still be invalidated/deleted
-            # concurrently, matching 0 rows. Bail out BEFORE the observation_history
-            # INSERT below — that INSERT carries an observation_id FK onto memory_units,
-            # so appending history for a now-missing row raises ForeignKeyViolationError,
-            # a non-retryable integrity failure that would fail the whole consolidation
-            # op for a row that simply no longer exists.
-            if updated_rows == 0:
+            if not snaps:
                 logger.debug(
-                    f"Update skipped: observation {observation_id} no longer exists "
-                    "(deleted/invalidated concurrently); not appending history"
+                    f"Update aborted: observation {observation_id} no longer exists "
+                    "(deleted/invalidated concurrently)"
                 )
-                return None
+                raise _BatchStaleError(f"update_target_missing:{observation_id}")
+            fresh = snaps[0].memory
+            expected_revision = snaps[0].revision
+            # Merge against the FRESH row (authoritative under the lock), not the Phase-A
+            # ``model`` — LEAST/GREATEST semantics over existing + new values.
+            fresh_source_ids = list(fresh.source_memory_ids or [])
+            merged_source_ids = [str(s) for s in fresh_source_ids] + [str(mid) for mid in live_ids]
+            merged_source_ids = list(dict.fromkeys(merged_source_ids))
+            fresh_tags = set(fresh.tags or [])
+            merged_tags = list(fresh_tags | source_tags)
+            patch = MemoryPatch(
+                unit_id=observation_id,
+                text=new_text,
+                embedding=embedding_str,
+                tags=merged_tags,
+                proof_count_delta=len(merged_source_ids) - len(fresh_source_ids),
+                occurred_start=_merge_min(fresh.occurred_start, source_occurred_start),
+                occurred_end=_merge_max(fresh.occurred_end, source_occurred_end),
+                mentioned_at=_merge_max(fresh.mentioned_at, source_mentioned_at),
+                source_memory_ids=merged_source_ids,
+                search_vector=(
+                    _native_search_vector_update(config, "{text_param}") or None
+                ),
+            )
+            outcome = await store.cas_update_memory(
+                conn=conn,
+                fq_table=fq_table,
+                bank_id=bank_id,
+                unit_id=observation_id,
+                expected_revision=expected_revision,
+                patch=patch,
+            )
+            if outcome == CASOutcome.STALE:
+                logger.warning(
+                    f"Update aborted: observation {observation_id} mutated concurrently "
+                    "(CAS STALE); aborting whole batch with zero writes"
+                )
+                raise _BatchStaleError(f"update_target_stale:{observation_id}")
+            if outcome == CASOutcome.MISSING:
+                logger.warning(
+                    f"Update aborted: observation {observation_id} deleted concurrently "
+                    "(CAS MISSING); aborting whole batch with zero writes"
+                )
+                raise _BatchStaleError(f"update_target_missing:{observation_id}")
+            source_ids = merged_source_ids
         else:
             # Upsert overwrites the whole observation, so start from its current state (fetched
             # from the store) and apply the same merge the SQL does — LEAST/GREATEST on the times
@@ -3443,14 +3483,43 @@ async def _execute_delete_action(
     observation_id: str,
     txn=None,
 ) -> None:
-    """Delete a superseded or contradicted observation."""
+    """Delete a superseded or contradicted observation.
+
+    Blocker 5 (judge 5f7f900d): the target must be deleted through the store CAS seam, never
+    by an unconditional row delete. Snapshot it fresh under the caller's transaction, then
+    ``cas_delete_memory`` gated on the expected revision token; a concurrently-mutated/deleted
+    target returns STALE/MISSING -> raise ``_BatchStaleError`` so the whole original batch
+    rolls back with zero writes (Ruling 1).
+    """
     store = get_memories()
     if store.writes_memory_rows_in_sql_for(bank_id):
-        await conn.execute(
-            f"DELETE FROM {fq_table('memory_units')} WHERE id = $1 AND bank_id = $2 AND fact_type = 'observation'",
-            uuid.UUID(observation_id),
-            bank_id,
+        snaps = await store.snapshot_memories(
+            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[observation_id]
         )
+        if not snaps:
+            logger.debug(
+                f"Delete aborted: observation {observation_id} already gone (CAS MISSING)"
+            )
+            raise _BatchStaleError(f"delete_target_missing:{observation_id}")
+        outcome = await store.cas_delete_memory(
+            conn=conn,
+            fq_table=fq_table,
+            bank_id=bank_id,
+            unit_id=observation_id,
+            expected_revision=snaps[0].revision,
+        )
+        if outcome == CASOutcome.STALE:
+            logger.warning(
+                f"Delete aborted: observation {observation_id} mutated concurrently "
+                "(CAS STALE); aborting whole batch with zero writes"
+            )
+            raise _BatchStaleError(f"delete_target_stale:{observation_id}")
+        if outcome == CASOutcome.MISSING:
+            logger.warning(
+                f"Delete aborted: observation {observation_id} deleted concurrently "
+                "(CAS MISSING); aborting whole batch with zero writes"
+            )
+            raise _BatchStaleError(f"delete_target_missing:{observation_id}")
     else:
         await store.delete_facts(bank_id, [observation_id], txn=txn)
     await _delete_observation_history(conn, bank_id, observation_id)

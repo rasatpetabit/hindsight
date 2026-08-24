@@ -169,6 +169,12 @@ class MemoryPatch:
 
     ``proof_count_delta`` is relative; everything else is an absolute set.
     ``metadata`` merges into the existing bag rather than replacing it.
+
+    ``source_memory_ids`` is an absolute replacement of the row's source lineage.
+    ``search_vector`` is a full SET-clause fragment (e.g. ``",\n search_vector =
+    to_tsvector('english'::regconfig, COALESCE({text_param}, ''))"``) whose ``{text_param}``
+    placeholder is substituted with the CAS row-update parameter that holds ``text``; it keeps
+    Oracle safe by being None there.
     """
 
     unit_id: str
@@ -183,6 +189,8 @@ class MemoryPatch:
     mentioned_at: datetime | None = None
     metadata: dict[str, str] | None = None
     proof_count_delta: int = 0
+    source_memory_ids: list[str] | None = None
+    search_vector: str | None = None
 
 
 @dataclass

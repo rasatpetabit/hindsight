@@ -620,13 +620,17 @@ async def cas_update_memory(
     mu = fq_table("memory_units")
     sets: list[str] = []
     params: list[Any] = [bank_id, str(unit_id)]
+    text_param: int | None = None
 
     def _param(v: Any) -> int:
         params.append(v)
         return len(params)
 
     if patch.text is not None:
-        sets.append(f"text = ${_param(patch.text)}")
+        text_param = _param(patch.text)
+        sets.append(f"text = ${text_param}")
+    if patch.embedding is not None:
+        sets.append(f"embedding = ${_param(str(patch.embedding))}::vector")
     if patch.tags is not None:
         sets.append(f"tags = ${_param(list(patch.tags))}")
     if patch.event_date is not None or patch.occurred_start is not None or patch.occurred_end is not None or patch.mentioned_at is not None:
@@ -643,13 +647,25 @@ async def cas_update_memory(
         sets.append(f"metadata = ${_param(json.dumps(patch.metadata))}::jsonb")
     if patch.proof_count_delta:
         sets.append(f"proof_count = GREATEST(0, proof_count + ${_param(int(patch.proof_count_delta))})")
+    if patch.source_memory_ids is not None:
+        sets.append(f"source_memory_ids = ${_param([uuid.UUID(str(s)) for s in patch.source_memory_ids])}::uuid[]")
 
     if not sets:
         # Nothing to change — the state already matches (no-op APPLIED).
         return CASOutcome.APPLIED
 
+    # search_vector is a full SET-clause fragment (``,\n search_vector =
+    # to_tsvector('english'::regconfig, COALESCE({text_param}, ''))``) with ``{text_param}``
+    # resolved to the row-update parameter that holds ``text``; appended verbatim after the
+    # numbered placeholders. Oracle emits nothing (caller passes None there).
+    search_vector_clause = ""
+    if patch.search_vector:
+        if text_param is None:
+            raise ValueError("MemoryPatch.search_vector requires patch.text to be set")
+        search_vector_clause = patch.search_vector.format(text_param=f"${text_param}")
+
     await conn.execute(
-        f"UPDATE {mu} SET {', '.join(sets)}, updated_at = now() WHERE bank_id = $1 AND id = $2::uuid",
+        f"UPDATE {mu} SET {', '.join(sets)}, updated_at = now(){search_vector_clause} WHERE bank_id = $1 AND id = $2::uuid",
         *params,
     )
     return CASOutcome.APPLIED
