@@ -61,6 +61,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class _BatchStaleError(Exception):
+    """Raised inside the Phase-B transaction when a prepared plan is stale under the guard.
+
+    Ruling 1: a stale plan aborts the ENTIRE Phase-B attempt. Raising this INSIDE the
+    ``async with conn.transaction()`` scope makes the context manager roll back every write
+    made by earlier plans; it is caught ONLY outside that scope so the rollback is guaranteed.
+    The carried ``reason`` is logged for diagnostics and the batch contributes zero progress.
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
 @asynccontextmanager
 async def _write_group(pool, conn=None):
     """Yield a connection for one logical write-group.
@@ -1843,40 +1857,39 @@ async def _run_consolidation_job(
                 # the failed marks share one logical write-group fate with the witness.
                 store = get_memories()
                 now = datetime.now(timezone.utc)
-                batch_stale = False
                 batch_stale_reason: str | None = None
                 async with acquire_with_retry(pool) as conn:
                     # The single bank-level commit guard (design §4.1): one FOR UPDATE row lock.
                     # No lease table, no advisory lock — released by commit/rollback/teardown.
-                    async with conn.transaction():
-                        await conn.execute(
-                            f"SELECT bank_id FROM {fq_table('banks')} WHERE bank_id = $1 FOR UPDATE",
-                            bank_id,
-                        )
-                        # Ruling 1: validation MUST precede mutation. Prevalidate every prepared
-                        # plan under the guard BEFORE any delete/update/create/source-mark/
-                        # witness executes. If any plan is stale, abort the ENTIRE Phase-B attempt:
-                        # roll back all writes, no marks/witness/refresh-tags/decide. The batch is
-                        # then eligible for a bounded reprepare outside the lock (Ruling 3). We do
-                        # NOT salvage the non-stale subset into a partial commit.
-                        if prepared_plans:
-                            for prepared in prepared_plans:
-                                reason = await _prevalidate_prepared_batch(prepared=prepared, conn=conn, bank_id=bank_id)
-                                if reason != "ok":
-                                    batch_stale = True
-                                    batch_stale_reason = reason
-                                    logger.warning(f"[CONSOLIDATION] bank={bank_id} Phase-B prevalidation stale ({reason}); aborting whole batch with zero writes")
-                                    break
-                        if not batch_stale:
+                    try:
+                        async with conn.transaction():
+                            await conn.execute(
+                                f"SELECT bank_id FROM {fq_table('banks')} WHERE bank_id = $1 FOR UPDATE",
+                                bank_id,
+                            )
+                            # Ruling 1: validation MUST precede mutation. Prevalidate every
+                            # prepared plan under the guard BEFORE any delete/update/create/
+                            # source-mark/witness executes. If any plan is stale, RAISE so the
+                            # ``async with conn.transaction()`` context manager rolls back the
+                            # ENTIRE Phase-B attempt — every write made by earlier plans included.
+                            # No marks/witness/refresh-tags/decide. We do NOT salvage the non-stale
+                            # subset into a partial commit.
+                            if prepared_plans:
+                                for prepared in prepared_plans:
+                                    reason = await _prevalidate_prepared_batch(prepared=prepared, conn=conn, bank_id=bank_id)
+                                    if reason != "ok":
+                                        logger.warning(f"[CONSOLIDATION] bank={bank_id} Phase-B prevalidation stale ({reason}); aborting whole batch with zero writes")
+                                        raise _BatchStaleError(reason)
                             for prepared in prepared_plans:
                                 presults, pdeleted, pstale = await _commit_prepared_batch(prepared=prepared, pool=pool, memory_engine=memory_engine, bank_id=bank_id, config=config, perf=batch_perf, txn=_batch_txn, conn=conn)
+                                if pstale:
+                                    # CAS stale during mutation (final safety net): earlier plans
+                                    # may already have written rows in THIS transaction; raising
+                                    # rolls them all back together (one-batch/one-fate).
+                                    logger.warning(f"[CONSOLIDATION] bank={bank_id} CAS stale during mutation ({sorted(pstale)[:5]}); aborting whole batch")
+                                    raise _BatchStaleError(f"cas_stale:{sorted(pstale)[:5]}")
                                 all_deleted += pdeleted
                                 stale_ids |= pstale
-                                if pstale:
-                                    logger.warning(f"[CONSOLIDATION] bank={bank_id} CAS stale during mutation ({sorted(pstale)[:5]}); aborting whole batch")
-                                    batch_stale = True
-                                    batch_stale_reason = f"cas_stale:{sorted(pstale)[:5]}"
-                                    break
                                 if not all_results:
                                     all_results.extend(presults)
                                 else:
@@ -1893,35 +1906,76 @@ async def _run_consolidation_job(
                                                 new_updated = new.get("updated", 1 if new.get("action") == "updated" else 0)
                                                 total = existing_created + existing_updated + new_created + new_updated
                                                 all_results[i] = {"action": "multiple", "created": existing_created + new_created, "updated": existing_updated + new_updated, "merged": 0, "total_actions": total}
-                        # Only a fully-validated batch may be marked / witnessed / decided.
-                        # Marks+witness also run when there are no prepared plans but LLM failures
-                        # occurred (failed_ids) — the all-LLM-failed case still needs its failed
-                        # marks + witness to share one logical write-group fate.
-                        if not batch_stale and (prepared_plans or failed_ids):
-                            effective_succeeded = [mem_id for mem_id in succeeded_ids if str(mem_id) not in stale_ids]
-                            if effective_succeeded:
-                                await store.mark_consolidated(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(mem_id) for mem_id in effective_succeeded], when=now, failed=False, txn=_batch_txn)
-                            if failed_ids:
-                                await store.mark_consolidated(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(mem_id) for mem_id in failed_ids], when=now, failed=True, txn=_batch_txn)
-                            await _txn_provider.write_txn_witness(_batch_txn, conn=conn, fq_table=fq_table)
-                            # Persist this batch's mental-model refresh tags atomically with the
-                            # witness (#3411). Only succeeded sources contribute a tag.
-                            if operation_id and effective_succeeded:
-                                succeeded_set = {str(mem_id) for mem_id in effective_succeeded}
-                                batch_tags = sorted(
-                                    {
-                                        t
-                                        for m in llm_batch_local
-                                        if str(m["id"]) in succeeded_set
-                                        for t in (m.get("tags") or [])
-                                    }
-                                )
-                                if batch_tags:
-                                    await _persist_pending_refresh_tags(conn, operation_id, batch_tags)
+                            # Only a fully-validated batch may be marked / witnessed / decided.
+                            # Marks+witness also run when there are no prepared plans but LLM
+                            # failures occurred (failed_ids) — the all-LLM-failed case still needs
+                            # its failed marks + witness to share one logical write-group fate.
+                            if prepared_plans or failed_ids:
+                                effective_succeeded = [mem_id for mem_id in succeeded_ids if str(mem_id) not in stale_ids]
+                                if effective_succeeded:
+                                    await store.mark_consolidated(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(mem_id) for mem_id in effective_succeeded], when=now, failed=False, txn=_batch_txn)
+                                if failed_ids:
+                                    await store.mark_consolidated(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(mem_id) for mem_id in failed_ids], when=now, failed=True, txn=_batch_txn)
+                                await _txn_provider.write_txn_witness(_batch_txn, conn=conn, fq_table=fq_table)
+                                # Persist this batch's mental-model refresh tags atomically with
+                                # the witness (#3411). Only succeeded sources contribute a tag.
+                                if operation_id and effective_succeeded:
+                                    succeeded_set = {str(mem_id) for mem_id in effective_succeeded}
+                                    batch_tags = sorted(
+                                        {
+                                            t
+                                            for m in llm_batch_local
+                                            if str(m["id"]) in succeeded_set
+                                            for t in (m.get("tags") or [])
+                                        }
+                                    )
+                                    if batch_tags:
+                                        await _persist_pending_refresh_tags(conn, operation_id, batch_tags)
+                    except _BatchStaleError as e:
+                        # The ``async with conn.transaction()`` rolled back every write made so
+                        # far (prevalidation-abort or mutation-CAS-abort). Discard buffered
+                        # results/deleted counters so the stale attempt contributes nothing.
+                        batch_stale_reason = e.reason
+                        all_results.clear()
+                        all_deleted = 0
+
+                cancelled_local = False
+
+                if batch_stale_reason is not None:
+                    # Ruling 1: a stale batch rolled back with zero writes and no marks/witness.
+                    # Abort/unpublish the write-group (no committed fate) and give NO progress
+                    # credit — sources stay unconsolidated+unfailed and remain eligible for a
+                    # bounded reprepare outside the lock (Ruling 3). Neither processed/failed/
+                    # skipped may count this attempt.
+                    try:
+                        await _txn_provider.decide_txn(_batch_txn, commit=False)
+                    except Exception:
+                        logger.warning(
+                            f"[CONSOLIDATION] bank={bank_id} failed to abort write-group for stale"
+                            f" llm_batch #{batch_num_local}; recovery sweep will resolve it",
+                            exc_info=True,
+                        )
+                    logger.info(
+                        f"[CONSOLIDATION] bank={bank_id} llm_batch #{batch_num_local} aborted"
+                        f" stale (zero writes, no progress credit); reason={batch_stale_reason}"
+                    )
+                    return _BatchDeltas(
+                        stats={
+                            "memories_processed": 0,
+                            "observations_created": 0,
+                            "observations_updated": 0,
+                            "observations_merged": 0,
+                            "observations_deleted": 0,
+                            "actions_executed": 0,
+                            "skipped": 0,
+                            "memories_failed": 0,
+                        },
+                        tags=local_tags,
+                        cancelled=cancelled_local,
+                    )
 
                 # ---- Post-commit bookkeeping (no writes on the guarded conn) ----
                 # Note: when prepared_plans was empty we still decide/abort the txn below.
-                cancelled_local = False
                 if operation_id and not await memory_engine._check_op_alive(operation_id):
                     logger.info(
                         f"[CONSOLIDATION] bank={bank_id} operation {operation_id} cancelled (bank deleted), stopping early"
@@ -2021,26 +2075,6 @@ async def _run_consolidation_job(
                         exc_info=True,
                     )
                 raise
-
-            if batch_stale:
-                # Ruling 1: a stale batch rolled back with zero writes and no marks/witness.
-                # Abort the write-group (no committed fate) and give NO progress credit — the
-                # sources stay unconsolidated+unfailed and remain eligible for a bounded
-                # reprepare outside the lock (Ruling 3). Neither processed/failed/skipped may
-                # count this attempt.
-                try:
-                    await _txn_provider.decide_txn(_batch_txn, commit=False)
-                except Exception:
-                    logger.warning(
-                        f"[CONSOLIDATION] bank={bank_id} failed to abort write-group for stale"
-                        f" llm_batch #{batch_num_local}; recovery sweep will resolve it",
-                        exc_info=True,
-                    )
-                logger.info(
-                    f"[CONSOLIDATION] bank={bank_id} llm_batch #{batch_num_local} aborted"
-                    f" stale (zero writes, no progress credit); reason={batch_stale_reason}"
-                )
-                return _BatchDeltas(stats=local_stats, tags=local_tags, cancelled=cancelled_local)
 
             # The Phase-B transaction committed (witness + marks + observations); publish the group.
             await _txn_provider.decide_txn(_batch_txn, commit=True)

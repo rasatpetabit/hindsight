@@ -790,3 +790,107 @@ async def test_batch_prevalidation_completes_before_any_mutation():
                 commits += 1
             assert commits <= prevals, f"a mutation ran before its plan was validated: {order}"
         assert prevals > 0, "no plans were validated at all"
+
+
+async def test_mutation_cas_stale_rolls_back_earlier_writes():
+    """Ruling 1: a CAS-stale during mutation rolls back EARLIER plans' already-written rows.
+
+    Two plans in one Phase-B attempt (per-tag scoping). The first plan performs a REAL CREATE
+    (a row is written inside the transaction). The second plan's mutation then reports CAS
+    stale (synthetic via patch). The orchestrator must RAISE inside the transaction so the
+    context manager rolls back the FIRST plan's write too — zero observations may survive,
+    zero marks, zero progress credit.
+    """
+    from unittest.mock import patch
+
+    import hindsight_api.engine.consolidation.consolidator as C
+
+    async with _harness() as h:
+        bank_id = unique_bank("mut-cas-stale")
+        await h.create_bank(bank_id)
+        src = await h.seed_fact(bank_id, "Foxtrot scans every service.", tags=["tag-a", "tag-b"])
+        async with h.pool.acquire() as conn:
+            await conn.execute(
+                f"UPDATE {C.fq_table('memory_units')} SET observation_scopes = $1::jsonb"
+                f" WHERE bank_id=$2 AND id=$3::uuid",
+                '"per_tag"',
+                bank_id,
+                src,
+            )
+
+        real_commit = C._commit_prepared_batch
+        calls = {"n": 0}
+
+        async def _flaky_commit(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                # Second plan's mutation detects CAS stale -> orchestrator must raise + rollback
+                # the first plan's already-executed write.
+                return [], 0, {"synthetic-stale-id"}
+            return await real_commit(*args, **kwargs)
+
+        with patch.object(C, "_commit_prepared_batch", new=_flaky_commit):
+            result = await h.consolidate(bank_id)
+
+        # The first plan's real CREATE must have been rolled back too.
+        obs = await h.observations(bank_id)
+        assert len(obs) == 0, f"CAS-stale later plan must roll back earlier writes; got {len(obs)}"
+
+        # Source stays unconsolidated+unfailed (eligible for reprepare), no progress credit.
+        s = await h.source_state(bank_id, src)
+        assert s["consolidated_at"] is None and s["failed_at"] is None, s
+        assert result.get("observations_created", 0) == 0
+
+
+async def test_stale_batch_aborts_txn_not_publishes():
+    """Ruling 1: a stale batch ABORTS its write-group; never publishes/commits it.
+
+    For any store (SQL or non-SQL), the txn provider's ``decide_txn`` must be called with
+    ``commit=False`` (unpublish/abort) on a stale batch and NEVER with ``commit=True`` for
+    that batch. This is the cross-store abort guarantee: a non-SQL MemoryTxn for a stale
+    attempt must not be left published/committed.
+    """
+    from unittest.mock import patch
+
+    import hindsight_api.engine.consolidation.consolidator as C
+
+    async with _harness() as h:
+        bank_id = unique_bank("stale-abort-txn")
+        await h.create_bank(bank_id)
+        src = await h.seed_fact(bank_id, "Lima handles all deploys.", tags=["tag-a", "tag-b"])
+        async with h.pool.acquire() as conn:
+            await conn.execute(
+                f"UPDATE {C.fq_table('memory_units')} SET observation_scopes = $1::jsonb"
+                f" WHERE bank_id=$2 AND id=$3::uuid",
+                '"per_tag"',
+                bank_id,
+                src,
+            )
+
+        # Patch _prevalidate_prepared_batch to force staleness on every plan.
+        async def _always_stale(prepared, conn, bank_id):
+            return "create_stale:source_consumed:synthetic"
+
+        # Patch the txn provider's decide_txn to record commit flags.
+        from hindsight_api.engine.memories import get_memories
+
+        provider = get_memories()
+        flags: list[bool] = []
+        real_decide = provider.decide_txn
+
+        async def _rec_decide(txn, *, commit):
+            flags.append(commit)
+            return await real_decide(txn, commit=commit)
+
+        with (
+            patch.object(C, "_prevalidate_prepared_batch", new=_always_stale),
+            patch.object(provider, "decide_txn", new=_rec_decide),
+        ):
+            await h.consolidate(bank_id)
+
+        # A stale attempt must be aborted (commit=False), never published (commit=True).
+        assert flags, "decide_txn was never called"
+        assert all(f is False for f in flags), f"a stale batch was published/committed: {flags}"
+
+        # Zero observations survive the abort path.
+        assert len(await h.observations(bank_id)) == 0
