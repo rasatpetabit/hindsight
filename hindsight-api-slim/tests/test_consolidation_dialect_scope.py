@@ -30,8 +30,10 @@ async def test_oracle_rejected_before_consolidation_dependencies():
             request_context=object(),
         )
 
+    resolver.assert_not_called()
     resolver.assert_not_awaited()
     llm_wrapper.assert_not_called()
+    core.assert_not_called()
     core.assert_not_awaited()
     assert not backend.mock_calls
 
