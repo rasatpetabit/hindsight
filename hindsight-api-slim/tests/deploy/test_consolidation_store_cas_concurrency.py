@@ -120,17 +120,22 @@ async def test_two_process_create_race_one_observation(tmp_path):
         procs = [
             subprocess.Popen(
                 [sys.executable, "-c", _WRITER_SRC, _URL, bank_id, str(_HARNESS_DIR), str(result_a)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             ),
             subprocess.Popen(
                 [sys.executable, "-c", _WRITER_SRC, _URL, bank_id, str(_HARNESS_DIR), str(result_b)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             ),
         ]
         for p in procs:
-            assert p.wait(timeout=120) == 0, "writer subprocess failed"
+            _out, _err = p.communicate(timeout=120)
+            assert p.returncode == 0, (
+                f"writer subprocess failed rc={p.returncode}\n"
+                f"stdout={_out.decode(errors='replace')[-2000:]}\n"
+                f"stderr={_err.decode(errors='replace')[-2000:]}"
+            )
 
         ra = _json_load(result_a)
         rb = _json_load(result_b)
