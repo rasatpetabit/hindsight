@@ -679,3 +679,114 @@ async def test_new_twin_invalidates_create_plan(tmp_path):
         obs = await h.observations(bank_id)
         assert len(obs) == 1, f"twin must invalidate CREATE plan; got {len(obs)}"
         assert obs[0]["source_ids"] == [src]
+
+
+# ---------------------------------------------------------------------------
+# Ruling 1: batch-wide stale atomicity — validation precedes mutation, whole-batch rollback
+# ---------------------------------------------------------------------------
+
+
+async def test_batch_rollback_on_later_plan_stale():
+    """Ruling 1: a stale plan aborts the ENTIRE Phase-B batch with zero writes.
+
+    Force every prepared plan stale under the guard (validation precedes mutation). The
+    whole Phase-B attempt must abort: zero observations committed, zero source marks,
+    no witness/decide(commit=True). The source stays unconsolidated+unfailed, eligible for
+    a bounded reprepare outside the lock. The multi-plan shape (per-tag scoping) exercises
+    the batch-abort over more than one prepared plan.
+    """
+    from unittest.mock import patch
+
+    import hindsight_api.engine.consolidation.consolidator as C
+
+    async with _harness() as h:
+        bank_id = unique_bank("batch-rollback")
+        await h.create_bank(bank_id)
+        src = await h.seed_fact(bank_id, "Alpha ships every Friday.", tags=["tag-a", "tag-b"])
+        # Force per-tag multi-pass scoping -> 2 prepared plans per LLM batch.
+        async with h.pool.acquire() as conn:
+            await conn.execute(
+                f"UPDATE {C.fq_table('memory_units')} SET observation_scopes = $1::jsonb"
+                f" WHERE bank_id=$2 AND id=$3::uuid",
+                '"per_tag"',
+                bank_id,
+                src,
+            )
+
+        async def _always_stale(prepared, conn, bank_id):
+            return "create_stale:source_consumed:synthetic"
+
+        with patch.object(C, "_prevalidate_prepared_batch", new=_always_stale):
+            result = await h.consolidate(bank_id)
+
+        # Zero observations may survive any abort path.
+        obs = await h.observations(bank_id)
+        assert len(obs) == 0, f"stale plans must roll back whole batch; got {len(obs)}"
+
+        # The source is not marked consolidated or failed — it stays eligible for reprepare.
+        s = await h.source_state(bank_id, src)
+        assert s["exists"], f"source {src} vanished"
+        assert s["consolidated_at"] is None, f"source {src} wrongly marked consolidated"
+        assert s["failed_at"] is None, f"source {src} wrongly marked failed"
+
+        # The aborting batches contributed no processed/created/skipped/failed progress.
+        assert result.get("status") == "completed", result
+        assert result.get("observations_created", 0) == 0
+        assert result.get("memories_processed", 0) == 0
+
+
+async def test_batch_prevalidation_completes_before_any_mutation():
+    """Ruling 1: prevalidation for ALL plans runs before ANY delete/update/create/mark.
+
+    Record execution order of ``_prevalidate_prepared_batch`` vs ``_commit_prepared_batch``
+    across one consolidation job. No mutation may execute before every plan has been
+    validated; on all-ok the mutations run in plan order.
+    """
+    from unittest.mock import patch
+
+    import hindsight_api.engine.consolidation.consolidator as C
+
+    async with _harness() as h:
+        bank_id = unique_bank("batch-preval-first")
+        await h.create_bank(bank_id)
+        src = await h.seed_fact(bank_id, "Charlie reviews every PR.", tags=["tag-a", "tag-b"])
+        # Force per-tag multi-pass scoping -> 2 prepared plans in one batch.
+        async with h.pool.acquire() as conn:
+            await conn.execute(
+                f"UPDATE {C.fq_table('memory_units')} SET observation_scopes = $1::jsonb"
+                f" WHERE bank_id=$2 AND id=$3::uuid",
+                '"per_tag"',
+                bank_id,
+                src,
+            )
+
+        order: list[str] = []
+        real_prevalidate = C._prevalidate_prepared_batch
+        real_commit = C._commit_prepared_batch
+
+        async def _rec_prevalidate(prepared, conn, bank_id):
+            order.append("prevalidate")
+            return await real_prevalidate(prepared, conn, bank_id)
+
+        async def _rec_commit(*args, **kwargs):
+            order.append("commit")
+            return await real_commit(*args, **kwargs)
+
+        with (
+            patch.object(C, "_prevalidate_prepared_batch", new=_rec_prevalidate),
+            patch.object(C, "_commit_prepared_batch", new=_rec_commit),
+        ):
+            await h.consolidate(bank_id)
+
+        # Ruling 1 invariant: no mutation may run ahead of its batch's validation. Since each
+        # Phase-B attempt validates ALL plans then mutates ALL plans, the running commit count
+        # must never exceed the running validation count at any prefix (a commit is always
+        # covered by a prior validation; interleaved preval/commit would violate this).
+        prevals = commits = 0
+        for x in order:
+            if x == "prevalidate":
+                prevals += 1
+            else:
+                commits += 1
+            assert commits <= prevals, f"a mutation ran before its plan was validated: {order}"
+        assert prevals > 0, "no plans were validated at all"

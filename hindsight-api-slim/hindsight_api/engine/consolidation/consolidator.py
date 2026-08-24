@@ -909,6 +909,84 @@ async def _fresh_source_validation(
     return "ok"
 
 
+async def _prevalidate_prepared_batch(
+    prepared: "_PreparedBatch",
+    conn: "Connection",
+    bank_id: str,
+) -> str:
+    """Prevalidate ONE prepared plan under the Phase-B bank guard, before ANY mutation.
+
+    Ruling 1 (batch-wide stale atomicity): validation must precede mutation so a stale
+    plan aborts the ENTIRE Phase-B attempt with zero writes instead of continuing and
+    salvaging the non-stale subset. This runs once per plan before the first
+    delete/update/create/source-mark/witness executes.
+
+    Validates (fresh, under the guard):
+    - every CREATE's source ids — liveness, unconsumed, unchanged, no twin (the
+      existing :func:`_fresh_source_validation`);
+    - every UPDATE's target observation still exists AND its source ids are live/
+      unchanged/unconsumed;
+    - every DELETE's target observation still exists.
+
+    Returns ``"ok"`` when every plan is valid, or a short stale reason naming the
+    first invalid element. The caller aborts the whole batch on any non-"ok".
+    """
+
+    for pcreate in prepared.creates:
+        stale_reason = await _fresh_source_validation(
+            conn=conn,
+            bank_id=bank_id,
+            source_ids=pcreate.create_source_ids or [],
+            expected_fingerprints=prepared.source_snapshots,
+        )
+        if stale_reason != "ok":
+            return f"create_stale:{stale_reason}"
+
+    for pupd in prepared.updates:
+        # Target observation must still exist under the guard.
+        target_exists = await _observation_exists(conn, bank_id, pupd.update.observation_id)
+        if not target_exists:
+            return f"update_target_deleted:{pupd.update.observation_id}"
+        # Its source ids must still be live/unchanged/unconsumed.
+        upd_source_ids = [m["id"] for m in pupd.source_mems]
+        stale_reason = await _fresh_source_validation(
+            conn=conn,
+            bank_id=bank_id,
+            source_ids=upd_source_ids,
+            expected_fingerprints=prepared.source_snapshots,
+        )
+        if stale_reason != "ok":
+            return f"update_source_stale:{stale_reason}"
+
+    for delete in prepared.deletes:
+        target_exists = await _observation_exists(conn, bank_id, delete.observation_id)
+        if not target_exists:
+            return f"delete_target_deleted:{delete.observation_id}"
+
+    return "ok"
+
+
+async def _observation_exists(
+    conn: "Connection",
+    bank_id: str,
+    observation_id: str,
+) -> bool:
+    """Return whether an observation row exists in the bank (fresh read under guard)."""
+    store = get_memories()
+    if store.writes_memory_rows_in_sql_for(bank_id):
+        row = await conn.fetchval(
+            f"SELECT 1 FROM {fq_table('memory_units')}"
+            f" WHERE bank_id = $1 AND id = $2::uuid AND fact_type = 'observation'",
+            bank_id,
+            observation_id,
+        )
+        return row is not None
+    present = await store.get_memories(
+        conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[observation_id]
+    )
+    return any(str(m.unit_id) == str(observation_id) for m in present)
+
+
 class _CreateAction(BaseModel):
     text: str
     source_fact_ids: list[str]  # memory UUIDs from the NEW FACTS list
@@ -1765,6 +1843,8 @@ async def _run_consolidation_job(
                 # the failed marks share one logical write-group fate with the witness.
                 store = get_memories()
                 now = datetime.now(timezone.utc)
+                batch_stale = False
+                batch_stale_reason: str | None = None
                 async with acquire_with_retry(pool) as conn:
                     # The single bank-level commit guard (design §4.1): one FOR UPDATE row lock.
                     # No lease table, no advisory lock — released by commit/rollback/teardown.
@@ -1773,93 +1853,71 @@ async def _run_consolidation_job(
                             f"SELECT bank_id FROM {fq_table('banks')} WHERE bank_id = $1 FOR UPDATE",
                             bank_id,
                         )
-                        for prepared in prepared_plans:
-                            presults, pdeleted, pstale = await _commit_prepared_batch(
-                                prepared=prepared,
-                                pool=pool,
-                                memory_engine=memory_engine,
-                                bank_id=bank_id,
-                                config=config,
-                                perf=batch_perf,
-                                txn=_batch_txn,
-                                conn=conn,
-                            )
-                            all_deleted += pdeleted
-                            # Sources whose prepared writes were dropped as stale under the
-                            # guard stay UNconsolidated (design §6.1) so a bounded reprepare can
-                            # fold them into the survivor observation.
-                            stale_ids |= pstale
-                            # Merge per-scope results (same merge semantics as before).
-                            if not all_results:
-                                all_results.extend(presults)
-                            else:
-                                if len(presults) != len(all_results):
+                        # Ruling 1: validation MUST precede mutation. Prevalidate every prepared
+                        # plan under the guard BEFORE any delete/update/create/source-mark/
+                        # witness executes. If any plan is stale, abort the ENTIRE Phase-B attempt:
+                        # roll back all writes, no marks/witness/refresh-tags/decide. The batch is
+                        # then eligible for a bounded reprepare outside the lock (Ruling 3). We do
+                        # NOT salvage the non-stale subset into a partial commit.
+                        if prepared_plans:
+                            for prepared in prepared_plans:
+                                reason = await _prevalidate_prepared_batch(prepared=prepared, conn=conn, bank_id=bank_id)
+                                if reason != "ok":
+                                    batch_stale = True
+                                    batch_stale_reason = reason
+                                    logger.warning(f"[CONSOLIDATION] bank={bank_id} Phase-B prevalidation stale ({reason}); aborting whole batch with zero writes")
+                                    break
+                        if not batch_stale:
+                            for prepared in prepared_plans:
+                                presults, pdeleted, pstale = await _commit_prepared_batch(prepared=prepared, pool=pool, memory_engine=memory_engine, bank_id=bank_id, config=config, perf=batch_perf, txn=_batch_txn, conn=conn)
+                                all_deleted += pdeleted
+                                stale_ids |= pstale
+                                if pstale:
+                                    logger.warning(f"[CONSOLIDATION] bank={bank_id} CAS stale during mutation ({sorted(pstale)[:5]}); aborting whole batch")
+                                    batch_stale = True
+                                    batch_stale_reason = f"cas_stale:{sorted(pstale)[:5]}"
+                                    break
+                                if not all_results:
                                     all_results.extend(presults)
                                 else:
-                                    for i, (existing, new) in enumerate(zip(all_results, presults)):
-                                        if existing.get("action") == "skipped" and new.get("action") != "skipped":
-                                            all_results[i] = new
-                                        elif existing.get("action") != "skipped" and new.get("action") != "skipped":
-                                            existing_created = existing.get(
-                                                "created", 1 if existing.get("action") == "created" else 0
-                                            )
-                                            existing_updated = existing.get(
-                                                "updated", 1 if existing.get("action") == "updated" else 0
-                                            )
-                                            new_created = new.get("created", 1 if new.get("action") == "created" else 0)
-                                            new_updated = new.get("updated", 1 if new.get("action") == "updated" else 0)
-                                            total = existing_created + existing_updated + new_created + new_updated
-                                            all_results[i] = {
-                                                "action": "multiple",
-                                                "created": existing_created + new_created,
-                                                "updated": existing_updated + new_updated,
-                                                "merged": 0,
-                                                "total_actions": total,
-                                            }
-                        # Mark through the store so the flag lands wherever the source facts live —
-                        # tagged with this batch's txn, so marks become visible together with the
-                        # observations above (same logical write-group fate).
-                        # Stale sources (dropped with zero writes under §6.1) are excluded from
-                        # the succeeded set: they remain eligible for bounded reprepare instead of
-                        # being marked terminal.
-                        effective_succeeded = [
-                            mem_id for mem_id in succeeded_ids if str(mem_id) not in stale_ids
-                        ]
-                        if effective_succeeded:
-                            await store.mark_consolidated(
-                                conn=conn,
-                                fq_table=fq_table,
-                                bank_id=bank_id,
-                                unit_ids=[str(mem_id) for mem_id in effective_succeeded],
-                                when=now,
-                                failed=False,
-                                txn=_batch_txn,
-                            )
-                        if failed_ids:
-                            await store.mark_consolidated(
-                                conn=conn,
-                                fq_table=fq_table,
-                                bank_id=bank_id,
-                                unit_ids=[str(mem_id) for mem_id in failed_ids],
-                                when=now,
-                                failed=True,
-                                txn=_batch_txn,
-                            )
-                        await _txn_provider.write_txn_witness(_batch_txn, conn=conn, fq_table=fq_table)
-                        # Persist this batch's mental-model refresh tags atomically with the
-                        # witness (#3411). Only succeeded sources contribute a tag.
-                        if operation_id and effective_succeeded:
-                            succeeded_set = {str(mem_id) for mem_id in effective_succeeded}
-                            batch_tags = sorted(
-                                {
-                                    t
-                                    for m in llm_batch_local
-                                    if str(m["id"]) in succeeded_set
-                                    for t in (m.get("tags") or [])
-                                }
-                            )
-                            if batch_tags:
-                                await _persist_pending_refresh_tags(conn, operation_id, batch_tags)
+                                    if len(presults) != len(all_results):
+                                        all_results.extend(presults)
+                                    else:
+                                        for i, (existing, new) in enumerate(zip(all_results, presults)):
+                                            if existing.get("action") == "skipped" and new.get("action") != "skipped":
+                                                all_results[i] = new
+                                            elif existing.get("action") != "skipped" and new.get("action") != "skipped":
+                                                existing_created = existing.get("created", 1 if existing.get("action") == "created" else 0)
+                                                existing_updated = existing.get("updated", 1 if existing.get("action") == "updated" else 0)
+                                                new_created = new.get("created", 1 if new.get("action") == "created" else 0)
+                                                new_updated = new.get("updated", 1 if new.get("action") == "updated" else 0)
+                                                total = existing_created + existing_updated + new_created + new_updated
+                                                all_results[i] = {"action": "multiple", "created": existing_created + new_created, "updated": existing_updated + new_updated, "merged": 0, "total_actions": total}
+                        # Only a fully-validated batch may be marked / witnessed / decided.
+                        # Marks+witness also run when there are no prepared plans but LLM failures
+                        # occurred (failed_ids) — the all-LLM-failed case still needs its failed
+                        # marks + witness to share one logical write-group fate.
+                        if not batch_stale and (prepared_plans or failed_ids):
+                            effective_succeeded = [mem_id for mem_id in succeeded_ids if str(mem_id) not in stale_ids]
+                            if effective_succeeded:
+                                await store.mark_consolidated(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(mem_id) for mem_id in effective_succeeded], when=now, failed=False, txn=_batch_txn)
+                            if failed_ids:
+                                await store.mark_consolidated(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(mem_id) for mem_id in failed_ids], when=now, failed=True, txn=_batch_txn)
+                            await _txn_provider.write_txn_witness(_batch_txn, conn=conn, fq_table=fq_table)
+                            # Persist this batch's mental-model refresh tags atomically with the
+                            # witness (#3411). Only succeeded sources contribute a tag.
+                            if operation_id and effective_succeeded:
+                                succeeded_set = {str(mem_id) for mem_id in effective_succeeded}
+                                batch_tags = sorted(
+                                    {
+                                        t
+                                        for m in llm_batch_local
+                                        if str(m["id"]) in succeeded_set
+                                        for t in (m.get("tags") or [])
+                                    }
+                                )
+                                if batch_tags:
+                                    await _persist_pending_refresh_tags(conn, operation_id, batch_tags)
 
                 # ---- Post-commit bookkeeping (no writes on the guarded conn) ----
                 # Note: when prepared_plans was empty we still decide/abort the txn below.
@@ -1963,6 +2021,26 @@ async def _run_consolidation_job(
                         exc_info=True,
                     )
                 raise
+
+            if batch_stale:
+                # Ruling 1: a stale batch rolled back with zero writes and no marks/witness.
+                # Abort the write-group (no committed fate) and give NO progress credit — the
+                # sources stay unconsolidated+unfailed and remain eligible for a bounded
+                # reprepare outside the lock (Ruling 3). Neither processed/failed/skipped may
+                # count this attempt.
+                try:
+                    await _txn_provider.decide_txn(_batch_txn, commit=False)
+                except Exception:
+                    logger.warning(
+                        f"[CONSOLIDATION] bank={bank_id} failed to abort write-group for stale"
+                        f" llm_batch #{batch_num_local}; recovery sweep will resolve it",
+                        exc_info=True,
+                    )
+                logger.info(
+                    f"[CONSOLIDATION] bank={bank_id} llm_batch #{batch_num_local} aborted"
+                    f" stale (zero writes, no progress credit); reason={batch_stale_reason}"
+                )
+                return _BatchDeltas(stats=local_stats, tags=local_tags, cancelled=cancelled_local)
 
             # The Phase-B transaction committed (witness + marks + observations); publish the group.
             await _txn_provider.decide_txn(_batch_txn, commit=True)
