@@ -37,11 +37,13 @@ where the shapes are genuinely different; those are the seams, not accidental le
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from ...extensions.base import Extension
@@ -215,6 +217,86 @@ class ScanPage:
 
     memories: list[StoredMemory] = field(default_factory=list)
     next_page_token: str = ""
+
+
+class CASNotSupportedError(NotImplementedError):
+    """Raised when a store that cannot provide real compare-and-swap semantics is asked to.
+
+    The consolidation store-CAS seam is fail-closed by design (design doc §4.3): a store that
+    owns its rows elsewhere (``writes_memory_rows_in_sql == False``) must implement genuine
+    optimistic-concurrency semantics before it can participate in parallel consolidation.
+    Pretending a blind write succeeded would silently admit the very same-target races the
+    seam exists to rule out, so the base contract raises rather than silently no-op.
+    """
+
+
+class CASOutcome(Enum):
+    """Result of a compare-and-apply operation.
+
+    ``APPLIED`` — the expected state matched and the mutation was applied.
+    ``STALE`` — the expected state no longer matches (a concurrent writer changed it first);
+    nothing was written.
+    ``MISSING`` — the target row does not exist (deleted or never created); nothing was written.
+    """
+
+    APPLIED = "applied"
+    STALE = "stale"
+    MISSING = "missing"
+
+
+@dataclass
+class MemorySnapshot:
+    """A store-native snapshot of one memory's authoritative state, plus an opaque CAS token.
+
+    Consolidation reads a candidate/observation once (Phase A), holds the snapshot across the
+    slow LLM window, then applies its mutation under compare-and-swap (Phase B). The snapshot
+    carries exactly the fields consolidation validates or rewrites — the authoritative expected
+    state — and ``revision`` is an opaque token that changes if and only if that state changes.
+
+    For a SQL store the revision is derived from the authoritative row fields themselves (no
+    schema revision column needed, per design §4.3); the token must be stable for an unchanged
+    row and different for any materially changed one.
+    """
+
+    memory: StoredMemory
+    revision: str
+
+
+def memory_revision_token(memory: StoredMemory) -> str:
+    """Derive an opaque revision token from a :class:`StoredMemory`'s authoritative fields.
+
+    The consolidation-relevant mutable state: text, source lineage, tags, temporal fields,
+    fact type, context, metadata, proof count, and consolidated markers. Intentionally does not
+    include ``updated_at``/``created_at`` — consolidation deliberately leaves ``updated_at``
+    alone (see ``pg/reads.mark_consolidated``), so a token that changes on every bookkeeping
+    write would spuriously stale out unrelated proposals.
+
+    Returns a stable hex digest; equal snapshots always produce equal tokens and any change to
+    an authoritative field produces a different token.
+    """
+
+    def _iso(v: Any) -> Any:
+        if isinstance(v, datetime):
+            return v.isoformat()
+        return v
+
+    parts = [
+        str(memory.unit_id),
+        str(memory.text),
+        str(memory.fact_type),
+        str(_iso(memory.context)),
+        json.dumps(sorted(memory.tags or []), sort_keys=True),
+        json.dumps(sorted(str(s) for s in (memory.source_memory_ids or [])), sort_keys=True),
+        json.dumps(sorted(memory.metadata or {}, key=str), sort_keys=True, default=str),
+        str(memory.proof_count),
+        str(_iso(memory.event_date)),
+        str(_iso(memory.occurred_start)),
+        str(_iso(memory.occurred_end)),
+        str(_iso(memory.mentioned_at)),
+        str(_iso(memory.consolidated_at)),
+        json.dumps(memory.observation_scopes or [], sort_keys=True, default=str),
+    ]
+    return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
 
 
 @dataclass
@@ -693,6 +775,108 @@ class MemoriesExtension(Extension, ABC):
     async def update_memories(self, bank_id: str, patches: list[MemoryPatch], txn=None) -> None:
         """Apply partial updates. Only the fields set on each patch change."""
         raise NotImplementedError
+
+    # ------------------------------------------------------------------ consolidation CAS
+    #
+    # Store-native snapshot + compare-and-swap seam (design §4.3, precondition 1). Phase A of
+    # parallel consolidation snapshots the authoritative state; Phase B re-validates it under
+    # the bank guard and applies the mutation only if the state is unchanged since the snapshot.
+    # A store that cannot provide genuine optimistic concurrency must fail closed (raise
+    # :class:`CASNotSupportedError`) rather than silently pretend the write succeeded.
+
+    async def snapshot_memories(
+        self,
+        *,
+        conn,
+        fq_table,
+        bank_id: str,
+        unit_ids: list[str],
+    ) -> list[MemorySnapshot]:
+        """Store-native snapshot of authoritative state + opaque revision token for each unit.
+
+        The fields returned are exactly the ones consolidation validates or rewrites in Phase B:
+        text, source lineage, tags/temporal fields, fact type, context, metadata, proof count,
+        and consolidated markers. Missing ids are simply absent from the result.
+        """
+        raise CASNotSupportedError(
+            f"{type(self).__name__} does not implement snapshot_memories; "
+            "parallel consolidation requires a store-native snapshot/CAS seam."
+        )
+
+    async def cas_update_memory(
+        self,
+        *,
+        conn,
+        fq_table,
+        bank_id: str,
+        unit_id: str,
+        expected_revision: str,
+        patch: MemoryPatch,
+        txn: "MemoryTxn | None" = None,
+    ) -> CASOutcome:
+        """Atomically apply ``patch`` only if ``unit_id`` still matches ``expected_revision``.
+
+        Returns :attr:`CASOutcome.APPLIED` on success, :attr:`CASOutcome.STALE` when the target
+        changed since the snapshot (nothing written), :attr:`CASOutcome.MISSING` when it no
+        longer exists (nothing written). Must execute inside the caller's bank transaction —
+        never an independent commit.
+        """
+        raise CASNotSupportedError(
+            f"{type(self).__name__} does not implement cas_update_memory; "
+            "parallel consolidation requires store-native compare-and-swap."
+        )
+
+    async def cas_delete_memory(
+        self,
+        *,
+        conn,
+        fq_table,
+        bank_id: str,
+        unit_id: str,
+        expected_revision: str,
+        txn: "MemoryTxn | None" = None,
+    ) -> CASOutcome:
+        """Atomically delete ``unit_id`` only if it still matches ``expected_revision``.
+
+        Returns :attr:`CASOutcome.APPLIED` on success, :attr:`CASOutcome.STALE` when the target
+        changed since the snapshot (nothing written), :attr:`CASOutcome.MISSING` when it no
+        longer exists (nothing written). Must execute inside the caller's bank transaction.
+        """
+        raise CASNotSupportedError(
+            f"{type(self).__name__} does not implement cas_delete_memory; "
+            "parallel consolidation requires store-native compare-and-swap."
+        )
+
+    async def cas_fold_observation(
+        self,
+        *,
+        conn,
+        fq_table,
+        bank_id: str,
+        observation_id: str,
+        expected_revision: str,
+        merged_text: str,
+        merged_embedding: Any = None,
+        add_source_ids: list[str] | None = None,
+        tags: list[str] | None = None,
+        event_date: datetime | None = None,
+        occurred_start: datetime | None = None,
+        occurred_end: datetime | None = None,
+        mentioned_at: datetime | None = None,
+        created_at: datetime | None = None,
+        txn: "MemoryTxn | None" = None,
+    ) -> CASOutcome:
+        """Atomically fold extra sources + merged text into an observation if it matches the token.
+
+        The observation's ``source_memory_ids`` gain ``add_source_ids`` (deduped), ``text`` becomes
+        ``merged_text``, and ``proof_count`` follows the source count — all in one atomic update
+        gated on ``expected_revision``. Returns :attr:`CASOutcome.APPLIED` / ``STALE`` / ``MISSING``
+        as above. Must execute inside the caller's bank transaction.
+        """
+        raise CASNotSupportedError(
+            f"{type(self).__name__} does not implement cas_fold_observation; "
+            "parallel consolidation requires store-native compare-and-swap."
+        )
 
     # ------------------------------------------------------------------ recall
 
@@ -1269,17 +1453,24 @@ __all__ = [
     "META_SOURCE_MEMORY_IDS",
     "META_TEXT_SIGNALS",
     "META_UPDATED_AT",
+    "CASNotSupportedError",
     "CausalEdgeRecord",
     "DeletePredicate",
     "EntityPrunePassResult",
     "FactRecord",
     "MemoriesExtension",
     "MemoryPatch",
+    "MemorySnapshot",
     "MemoryTxn",
     "RelinkPassResult",
     "ScanPage",
     "StoredMemory",
     "build_fact_records",
     "build_text_signals",
+    "memory_revision_token",
     "source_key",
 ]
+
+_CAS_NAMES = ["CASNotSupportedError", "CASOutcome"]
+
+_CAS_NAMES = ["CASNotSupportedError", "CASOutcome"]

@@ -20,7 +20,8 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from ....config import get_config
-from ..base import StoredMemory
+from ..base import CASOutcome, MemoryPatch, StoredMemory, memory_revision_token
+from .reads import _MEMORY_COLUMNS, _stored_from_row
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ...retain.types import ProcessedFact
@@ -568,8 +569,202 @@ async def apply_edit(
     )
 
 
+async def _lock_and_revision(
+    *, conn, fq_table: Callable[[str], str], bank_id: str, unit_id: str
+) -> tuple[StoredMemory | None, str | None]:
+    """Lock one ``memory_units`` row FOR UPDATE and return its stored form + current revision.
+
+    Runs inside the caller's transaction (the Phase-B bank guard already holds the bank row,
+    and this takes the memory row in the fixed source-before-observation lock order). Returns
+    ``(None, None)`` when the row no longer exists.
+    """
+    row = await conn.fetchrow(
+        f"""
+        SELECT {_MEMORY_COLUMNS}
+        FROM {fq_table("memory_units")}
+        WHERE bank_id = $1 AND id = $2::uuid
+        FOR UPDATE
+        """,
+        bank_id,
+        str(unit_id),
+    )
+    if row is None:
+        return None, None
+    memory = _stored_from_row(row)
+    return memory, memory_revision_token(memory)
+
+
+async def cas_update_memory(
+    *,
+    conn,
+    fq_table: Callable[[str], str],
+    bank_id: str,
+    unit_id: str,
+    expected_revision: str,
+    patch: MemoryPatch,
+) -> CASOutcome:
+    """Atomically apply a partial update iff the row still matches ``expected_revision``.
+
+    Locks the row FOR UPDATE inside the caller's transaction, re-derives the authoritative
+    revision, and applies only on a match — the CAS guarantee is "the authoritative state I saw
+    in Phase A is unchanged". Returns APPLIED / STALE / MISSING; nothing is committed here.
+    """
+    memory, current_rev = await _lock_and_revision(
+        conn=conn, fq_table=fq_table, bank_id=bank_id, unit_id=unit_id
+    )
+    if memory is None:
+        return CASOutcome.MISSING
+    if current_rev != expected_revision:
+        return CASOutcome.STALE
+
+    mu = fq_table("memory_units")
+    sets: list[str] = []
+    params: list[Any] = [bank_id, str(unit_id)]
+
+    def _param(v: Any) -> int:
+        params.append(v)
+        return len(params)
+
+    if patch.text is not None:
+        sets.append(f"text = ${_param(patch.text)}")
+    if patch.tags is not None:
+        sets.append(f"tags = ${_param(list(patch.tags))}")
+    if patch.event_date is not None or patch.occurred_start is not None or patch.occurred_end is not None or patch.mentioned_at is not None:
+        # Temporal fields are absolute sets; JSONB cast keeps NULLs as-is.
+        if patch.event_date is not None:
+            sets.append(f"event_date = ${_param(patch.event_date)}")
+        if patch.occurred_start is not None:
+            sets.append(f"occurred_start = ${_param(patch.occurred_start)}")
+        if patch.occurred_end is not None:
+            sets.append(f"occurred_end = ${_param(patch.occurred_end)}")
+        if patch.mentioned_at is not None:
+            sets.append(f"mentioned_at = ${_param(patch.mentioned_at)}")
+    if patch.metadata is not None:
+        sets.append(f"metadata = ${_param(json.dumps(patch.metadata))}::jsonb")
+    if patch.proof_count_delta:
+        sets.append(f"proof_count = GREATEST(0, proof_count + ${_param(int(patch.proof_count_delta))})")
+
+    if not sets:
+        # Nothing to change — the state already matches (no-op APPLIED).
+        return CASOutcome.APPLIED
+
+    await conn.execute(
+        f"UPDATE {mu} SET {', '.join(sets)}, updated_at = now() WHERE bank_id = $1 AND id = $2::uuid",
+        *params,
+    )
+    return CASOutcome.APPLIED
+
+
+async def cas_delete_memory(
+    *,
+    conn,
+    fq_table: Callable[[str], str],
+    bank_id: str,
+    unit_id: str,
+    expected_revision: str,
+) -> CASOutcome:
+    """Atomically delete a memory iff it still matches ``expected_revision``.
+
+    Locks FOR UPDATE, compares the authoritative revision, and deletes only on a match.
+    Returns APPLIED / STALE / MISSING; nothing is committed here."""
+    memory, current_rev = await _lock_and_revision(
+        conn=conn, fq_table=fq_table, bank_id=bank_id, unit_id=unit_id
+    )
+    if memory is None:
+        return CASOutcome.MISSING
+    if current_rev != expected_revision:
+        return CASOutcome.STALE
+
+    mu = fq_table("memory_units")
+    await conn.execute(
+        f"DELETE FROM {mu} WHERE bank_id = $1 AND id = $2::uuid",
+        bank_id,
+        str(unit_id),
+    )
+    return CASOutcome.APPLIED
+
+
+async def cas_fold_observation(
+    *,
+    conn,
+    fq_table: Callable[[str], str],
+    bank_id: str,
+    observation_id: str,
+    expected_revision: str,
+    merged_text: str,
+    merged_embedding=None,
+    add_source_ids=None,
+    tags=None,
+    event_date=None,
+    occurred_start=None,
+    occurred_end=None,
+    mentioned_at=None,
+    created_at=None,
+) -> CASOutcome:
+    """Atomically fold extra sources + merged text into an observation iff it matches the token.
+
+    Locks the observation FOR UPDATE inside the caller's transaction, re-derives its revision,
+    and folds only on a match: source ids are unioned (deduped), text becomes ``merged_text``,
+    proof_count follows the source count. Returns APPLIED / STALE / MISSING."""
+    memory, current_rev = await _lock_and_revision(
+        conn=conn, fq_table=fq_table, bank_id=bank_id, unit_id=observation_id
+    )
+    if memory is None:
+        return CASOutcome.MISSING
+    if current_rev != expected_revision:
+        return CASOutcome.STALE
+
+    add_ids = [uuid.UUID(str(s)) for s in (add_source_ids or [])]
+
+    mu = fq_table("memory_units")
+    params: list[Any] = [merged_text, bank_id, str(observation_id)]
+
+    if merged_embedding is not None:
+        embedding_sql = (", embedding = $" + str(len(params) + 1))
+        params.append(str(merged_embedding))
+    else:
+        embedding_sql = ""
+
+    tags_clause = ""
+    if tags is not None:
+        tags_clause = ", tags = $" + str(len(params) + 1)
+        params.append(list(tags))
+
+    # Temporal fields are absolute sets: pass through when the caller overrides them, otherwise
+    # preserve the twin's existing values (mirrors upstream _reconcile_merge_via_store fold).
+    temporal_clause = ""
+    for _col, _val in (
+        ("event_date", event_date),
+        ("occurred_start", occurred_start),
+        ("occurred_end", occurred_end),
+        ("mentioned_at", mentioned_at),
+        ("created_at", created_at),
+    ):
+        if _val is not None:
+            temporal_clause += f", {_col} = $" + str(len(params) + 1)
+            params.append(_val)
+
+    # Union sources + recompute proof_count; Oracle-safe search_vector clause kept empty for PG.
+    await conn.execute(
+        f"""
+        UPDATE {mu}
+        SET text = $1,
+            source_memory_ids = (SELECT array_agg(DISTINCT e) FROM unnest(source_memory_ids || ${len(params) + 1}::uuid[]) e),
+            proof_count = (SELECT count(DISTINCT e) FROM unnest(source_memory_ids || ${len(params) + 1}::uuid[]) e),
+            updated_at = now(){embedding_sql}{tags_clause}{temporal_clause}
+        WHERE bank_id = $2 AND id = $3::uuid
+        """,
+        *params,
+        add_ids,
+    )
+    return CASOutcome.APPLIED
+
+
 __all__ = [
     "apply_edit",
+    "cas_delete_memory",
+    "cas_fold_observation",
+    "cas_update_memory",
     "clear_unit_entities",
     "delete_document",
     "delete_observations",

@@ -36,7 +36,7 @@ from ...search.tags import (
     build_tags_where_clause,
     build_tags_where_clause_simple,
 )
-from ..base import ScanPage, StoredMemory
+from ..base import MemorySnapshot, ScanPage, StoredMemory, memory_revision_token
 
 # The `memory_units` projection every read here shares. Superset of the by-id
 # SELECT the recall source-facts path used (text/fact_type/context/timestamps/
@@ -156,6 +156,20 @@ async def get_memories(
         ids,
     )
     return [_stored_from_row(row) for row in rows]
+
+
+async def snapshot_memories(
+    *, conn, fq_table: Callable[[str], str], bank_id: str, unit_ids: list[str]
+) -> list[MemorySnapshot]:
+    """Store-native snapshot of authoritative state + opaque revision token (design §4.3).
+
+    Reuses the authoritative projection :func:`get_memories` reads and derives the opaque
+    CAS token from those fields via :func:`~hindsight_api.engine.memories.base.memory_revision_token`.
+    The token changes if and only if a consolidation-relevant field changes, so Phase B can
+    re-validate the exact state Phase A saw. Missing ids are simply absent.
+    """
+    memories = await get_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=unit_ids)
+    return [MemorySnapshot(memory=m, revision=memory_revision_token(m)) for m in memories]
 
 
 async def _semantic_edges(

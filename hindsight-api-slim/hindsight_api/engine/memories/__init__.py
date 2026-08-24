@@ -13,16 +13,20 @@ import logging
 
 from .base import (
     META_CHUNK_ID,
+    CASNotSupportedError,
+    CASOutcome,
     CausalEdgeRecord,
     DeletePredicate,
     FactRecord,
     MemoriesExtension,
     MemoryPatch,
+    MemorySnapshot,
     RecallArms,
     ScanPage,
     StoredMemory,
     build_fact_records,
     build_text_signals,
+    memory_revision_token,
     source_key,
 )
 
@@ -71,11 +75,14 @@ def set_memories(memories: MemoriesExtension | None) -> None:
 
 __all__ = [
     "META_CHUNK_ID",
+    "CASNotSupportedError",
+    "CASOutcome",
     "CausalEdgeRecord",
     "DeletePredicate",
     "FactRecord",
     "MemoriesExtension",
     "MemoryPatch",
+    "MemorySnapshot",
     "RecallArms",
     "ScanPage",
     "StoredMemory",
@@ -84,5 +91,6 @@ __all__ = [
     "create_memories",
     "get_memories",
     "set_memories",
+    "memory_revision_token",
     "source_key",
 ]

@@ -80,6 +80,80 @@ class PostgresMemories(MemoriesExtension):
     async def update_memories(self, bank_id: str, patches: list[MemoryPatch], txn=None) -> None:
         """No-op: the caller's UPDATE already wrote the row it holds open."""
 
+    # ------------------------------------------------------------------ consolidation CAS
+    #
+    # Postgres implements the store-native snapshot + compare-and-swap seam by locking the
+    # target row FOR UPDATE inside the caller's transaction and re-deriving the authoritative
+    # revision before applying. See design §4.3 / precondition 1.
+
+    async def snapshot_memories(
+        self,
+        *,
+        conn,
+        fq_table,
+        bank_id: str,
+        unit_ids: list[str],
+    ) -> list:
+        return await reads.snapshot_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=unit_ids)
+
+    async def cas_update_memory(
+        self,
+        *,
+        conn,
+        fq_table,
+        bank_id: str,
+        unit_id: str,
+        expected_revision: str,
+        patch: MemoryPatch,
+        txn=None,
+    ):
+        return await writes.cas_update_memory(
+            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_id=unit_id,
+            expected_revision=expected_revision, patch=patch,
+        )
+
+    async def cas_delete_memory(
+        self,
+        *,
+        conn,
+        fq_table,
+        bank_id: str,
+        unit_id: str,
+        expected_revision: str,
+        txn=None,
+    ):
+        return await writes.cas_delete_memory(
+            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_id=unit_id,
+            expected_revision=expected_revision,
+        )
+
+    async def cas_fold_observation(
+        self,
+        *,
+        conn,
+        fq_table,
+        bank_id: str,
+        observation_id: str,
+        expected_revision: str,
+        merged_text: str,
+        merged_embedding=None,
+        add_source_ids=None,
+        tags=None,
+        event_date=None,
+        occurred_start=None,
+        occurred_end=None,
+        mentioned_at=None,
+        created_at=None,
+        txn=None,
+    ):
+        return await writes.cas_fold_observation(
+            conn=conn, fq_table=fq_table, bank_id=bank_id, observation_id=observation_id,
+            expected_revision=expected_revision, merged_text=merged_text,
+            merged_embedding=merged_embedding, add_source_ids=add_source_ids, tags=tags,
+            event_date=event_date, occurred_start=occurred_start, occurred_end=occurred_end,
+            mentioned_at=mentioned_at, created_at=created_at,
+        )
+
     # ------------------------------------------------------------------ recall
 
     async def recall_unified(
