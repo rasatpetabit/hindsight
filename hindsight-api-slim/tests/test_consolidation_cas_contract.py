@@ -22,6 +22,7 @@ database) is covered separately in task 1b. This file deliberately touches no DB
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from uuid import UUID
 
 import pytest
 
@@ -83,6 +84,7 @@ def test_revision_token_stable_under_unrelated_field_changes():
         lambda: dict(source_memory_ids=["s1"]),
         lambda: dict(source_memory_ids=["s2", "s1"]),  # order-independent -> same as [s1,s2]
         lambda: dict(metadata={"other": "x"}),
+        lambda: dict(metadata={"source": "CHANGED"}),  # same key, different value
         lambda: dict(proof_count=3),
         lambda: dict(event_date=None),
         lambda: dict(occurred_start=datetime(2023, 12, 31, tzinfo=timezone.utc)),
@@ -114,6 +116,30 @@ def test_revision_token_tag_order_insensitive():
     a = _mem(tags=["programming", "history"])
     b = _mem(tags=["history", "programming"])
     assert memory_revision_token(a) == memory_revision_token(b)
+
+
+def test_revision_token_sensitive_to_metadata_values():
+    # Production metadata is an untyped dict; the live collision was numeric values.
+    a = _mem(metadata={"confidence": 0.1})
+    b = _mem(metadata={"confidence": 0.9})
+    assert memory_revision_token(a) != memory_revision_token(b)
+
+
+def test_revision_token_resists_delimiter_collision():
+    a = _mem(text="Ada", context="designed\x1fthe first algorithm.")
+    b = _mem(text="Ada\x1fdesigned", context="the first algorithm.")
+    assert memory_revision_token(a) != memory_revision_token(b)
+
+
+def test_revision_token_observation_scopes_order_insensitive():
+    a = _mem(observation_scopes=["harness:pi", "shared"])
+    b = _mem(observation_scopes=["shared", "harness:pi"])
+    assert memory_revision_token(a) == memory_revision_token(b)
+
+
+def test_revision_token_rejects_non_json_native_metadata():
+    with pytest.raises(TypeError):
+        memory_revision_token(_mem(metadata={"id": UUID("00000000-0000-0000-0000-000000000001")}))
 
 
 def test_snapshot_carries_memory_and_revision():

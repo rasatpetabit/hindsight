@@ -279,8 +279,10 @@ def memory_revision_token(memory: StoredMemory) -> str:
     alone (see ``pg/reads.mark_consolidated``), so a token that changes on every bookkeeping
     write would spuriously stale out unrelated proposals.
 
-    Returns a stable hex digest; equal snapshots always produce equal tokens and any change to
-    an authoritative field produces a different token.
+    Returns a stable hex digest of a canonical JSON object (named fields, sorted keys,
+    metadata values included, order-insensitive tags/source ids/observation_scopes).
+    Equal snapshots always produce equal tokens; any change to an authoritative field
+    produces a different token. Non-JSON-native leftover values raise rather than stringify.
     """
 
     def _iso(v: Any) -> Any:
@@ -288,23 +290,27 @@ def memory_revision_token(memory: StoredMemory) -> str:
             return v.isoformat()
         return v
 
-    parts = [
-        str(memory.unit_id),
-        str(memory.text),
-        str(memory.fact_type),
-        str(_iso(memory.context)),
-        json.dumps(sorted(memory.tags or []), sort_keys=True),
-        json.dumps(sorted(str(s) for s in (memory.source_memory_ids or [])), sort_keys=True),
-        json.dumps(sorted(memory.metadata or {}, key=str), sort_keys=True, default=str),
-        str(memory.proof_count),
-        str(_iso(memory.event_date)),
-        str(_iso(memory.occurred_start)),
-        str(_iso(memory.occurred_end)),
-        str(_iso(memory.mentioned_at)),
-        str(_iso(memory.consolidated_at)),
-        json.dumps(memory.observation_scopes or [], sort_keys=True, default=str),
-    ]
-    return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
+    payload = {
+        "unit_id": str(memory.unit_id),
+        "text": memory.text,
+        "fact_type": memory.fact_type,
+        "context": memory.context,
+        "tags": sorted(str(t) for t in (memory.tags or [])),
+        "source_memory_ids": sorted(str(s) for s in (memory.source_memory_ids or [])),
+        "metadata": memory.metadata or {},
+        "proof_count": memory.proof_count,
+        "event_date": _iso(memory.event_date),
+        "occurred_start": _iso(memory.occurred_start),
+        "occurred_end": _iso(memory.occurred_end),
+        "mentioned_at": _iso(memory.mentioned_at),
+        "consolidated_at": _iso(memory.consolidated_at),
+        "observation_scopes": sorted(str(s) for s in (memory.observation_scopes or [])),
+    }
+    # Datetimes are already ISO strings via `_iso`. Do not use default=str: a UUID
+    # object and the same UUID as a string would otherwise collide. Non-JSON-native
+    # leftover values must raise rather than stringify.
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 @dataclass
