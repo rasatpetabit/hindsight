@@ -43,7 +43,14 @@ from ..llm_trace import (
     trace_context_of,
 )
 from ..llm_wrapper import sanitize_llm_output
-from ..memories import CASOutcome, FactRecord, MemoryPatch, StoredMemory, get_memories
+from ..memories import (
+    CASOutcome,
+    FactRecord,
+    MemoryPatch,
+    MemorySnapshot,
+    StoredMemory,
+    get_memories,
+)
 from ..memory_engine import Budget, fq_table
 from ..retain import embedding_utils
 from .prompts import (
@@ -281,6 +288,9 @@ class _DedupOutcome:
     best_text: str = ""
     # Phase-A candidate snapshot (all probed ids, not just best).
     candidate_ids: set[str] = field(default_factory=set)
+    # Opaque CAS token of every probed candidate, keyed by unit id. Tokens come from
+    # the StoredMemory snapshot used for adjudication, not a later re-read.
+    candidate_revisions: dict[str, str] = field(default_factory=dict)
 
 
 async def _dedup_adjudicate(
@@ -334,19 +344,25 @@ async def _dedup_adjudicate(
     # Ruling 2: capture the Phase-A candidate snapshot — every observation id probed
     # (the bounded in-scope top-K), so the under-guard re-check can detect a fresh
     # semantic twin introduced during the LLM window.
-    candidate_ids: set[str] = set()
-    for r in results:
-        candidate_ids.add(str(r.id))
+    probed_ids = [str(r.id) for r in results]
+    snaps = await _snapshot_observations(pool, bank_id, probed_ids)
+    candidate_ids: set[str] = set(snaps)
+    candidate_revisions: dict[str, str] = {uid: snap.revision for uid, snap in snaps.items()}
+    # Adjudicate against snapshot-backed text so the focused LLM and the stored token
+    # describe the same StoredMemory (judge 76f0ac68).
     best_id: str | None = None
     best_text = ""
     best_sim = threshold  # only candidates at/above the threshold are considered
     for r in results:
         rid = str(r.id)
+        snap = snaps.get(rid)
+        if snap is None:
+            continue  # vanished between probe and snapshot; drop before adjudication
         if exclude_id is not None and rid == exclude_id:
             continue  # never match the anchor observation against itself
         sim = r.similarity or 0.0
         if sim >= best_sim:
-            best_id, best_text, best_sim = rid, r.text, sim
+            best_id, best_text, best_sim = rid, snap.memory.text, sim
 
     if best_id is None:
         return _DedupOutcome(
@@ -354,6 +370,7 @@ async def _dedup_adjudicate(
             merged_text="",
             should_merge=False,
             candidate_ids=candidate_ids,
+            candidate_revisions=candidate_revisions,
         )
 
     decision = _dedup_decision_from_response(
@@ -371,6 +388,7 @@ async def _dedup_adjudicate(
             should_merge=False,
             best_text=best_text,
             candidate_ids=candidate_ids,
+            candidate_revisions=candidate_revisions,
         )
     merged_text = (sanitize_llm_output(decision.text) or "").strip() or best_text
     return _DedupOutcome(
@@ -379,6 +397,7 @@ async def _dedup_adjudicate(
         should_merge=True,
         best_text=best_text,
         candidate_ids=candidate_ids,
+        candidate_revisions=candidate_revisions,
     )
 
 
@@ -395,6 +414,7 @@ async def _dedup_reconcile_create(
     *,
     conn=None,
     outcome=None,
+    expected_revision: str | None = None,
 ) -> str | None:
     """Semantic dedup for a single CREATE (create-time, focused 1-by-1).
 
@@ -426,6 +446,7 @@ async def _dedup_reconcile_create(
             outcome=outcome,
             create_source_ids=create_source_ids,
             txn=txn,
+            expected_revision=expected_revision,
         )
 
 
@@ -439,6 +460,7 @@ async def _dedup_fold_create(
     outcome,
     create_source_ids: list[uuid.UUID],
     txn=None,
+    expected_revision: str | None = None,
 ) -> str | None:
     """CAS-protected Phase-B fold of a CREATE's sources into its near-twin (design §4.4).
 
@@ -457,19 +479,13 @@ async def _dedup_fold_create(
         return None
 
     if store.writes_memory_rows_in_sql_for(bank_id):
-        # Snapshot the twin fresh under the caller's transaction to derive its CAS revision.
-        snaps = await store.snapshot_memories(
-            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[outcome.best_id]
-        )
-        if not snaps:
-            # The twin vanished during the connection-free LLM window. Don't skip the CREATE:
-            # returning None lets the caller insert the observation so nothing is lost.
+        expected_rev = expected_revision or ((outcome.candidate_revisions or {}).get(str(outcome.best_id)))
+        if not expected_rev:
             logger.debug(
-                "[CONSOLIDATION] dedup-merge target %s vanished before fold; proceeding with CREATE",
+                "[CONSOLIDATION] dedup-merge target %s has no Phase-A revision; proceeding with CREATE",
                 outcome.best_id[:8],
             )
             return None
-        expected_rev = snaps[0].revision
         folded = await store.cas_fold_observation(
             conn=conn,
             fq_table=fq_table,
@@ -585,9 +601,7 @@ async def _dedup_fold_update(
         # sources-before-observation: _filter_live_source_memories takes FOR SHARE on SOURCE rows
         # first, then snapshot_memories/cas take FOR UPDATE on observation rows — same order as the
         # normal write paths (_create_observation_directly / _execute_update_action).
-        upd_snap = await store.snapshot_memories(
-            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[updated_id]
-        )
+        upd_snap = await store.snapshot_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[updated_id])
         if not upd_snap:
             # Updated row vanished during the LLM window — nothing to reconcile.
             return
@@ -632,9 +646,7 @@ async def _dedup_fold_update(
         )
         return
 
-    updated_obs = await store.get_memories(
-        conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[updated_id]
-    )
+    updated_obs = await store.get_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[updated_id])
     updated_sources = list(updated_obs[0].source_memory_ids or []) if updated_obs else []
     live_u_sources = await _filter_live_source_memories(conn, bank_id, updated_sources)
     if not live_u_sources:
@@ -643,6 +655,8 @@ async def _dedup_fold_update(
         store, conn, memory_engine, bank_id, outcome.best_id, outcome.merged_text, live_u_sources, txn=txn
     )
     await _execute_delete_action(conn, bank_id, updated_id, txn=txn)
+
+
 @dataclass
 class _BatchDeltas:
     """Per-LLM-batch deltas, merged into the job's running stats after dispatch.
@@ -659,8 +673,6 @@ class _BatchDeltas:
     # invocation. The outer loop must NOT immediately re-fetch them in the same job
     # (no busy loop); they stay unconsolidated+unfailed for a LATER job invocation.
     retry_exhausted_ids: set[str] = field(default_factory=set)
-
-
 
 
 def _parse_observation_scopes(memory: dict[str, Any]) -> Any:
@@ -948,17 +960,105 @@ async def _fresh_source_validation(
             return f"source_consumed:{sid_str}"
         expected = expected_fingerprints.get(sid_str)
         if expected is not None and m is not None:
-            fresh = _source_fingerprint({"text": m.text, "fact_type": m.fact_type, "tags": m.tags or [],
-                                         "event_date": m.event_date, "occurred_start": m.occurred_start,
-                                         "occurred_end": m.occurred_end, "mentioned_at": m.mentioned_at,
-                                         "proof_count": m.proof_count,
-                                         "source_memory_ids": m.source_memory_ids or [],
-                                         "consolidated_at": m.consolidated_at})
+            fresh = _source_fingerprint(
+                {
+                    "text": m.text,
+                    "fact_type": m.fact_type,
+                    "tags": m.tags or [],
+                    "event_date": m.event_date,
+                    "occurred_start": m.occurred_start,
+                    "occurred_end": m.occurred_end,
+                    "mentioned_at": m.mentioned_at,
+                    "proof_count": m.proof_count,
+                    "source_memory_ids": m.source_memory_ids or [],
+                    "consolidated_at": m.consolidated_at,
+                }
+            )
             if not _fingerprint_matches(expected, fresh):
                 return f"source_changed:{sid_str}"
     # Non-SQL stores cannot do the SQL lineage twin check; their CAS seam + caller-owned
     # txn provides the equivalent guarantee on fold/merge paths.
     return "ok"
+
+
+def _iso_or_none(v: Any) -> str | None:
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v.isoformat()
+    return str(v)
+
+
+def _memory_fact_from_stored(memory: StoredMemory, template: "MemoryFact | None" = None) -> "MemoryFact":
+    """Rebuild a MemoryFact the LLM will see from the snapshot-backed StoredMemory."""
+    from ..response_models import MemoryFact
+
+    meta = None
+    if memory.metadata is not None:
+        meta = {str(k): str(v) for k, v in memory.metadata.items()}
+    return MemoryFact(
+        id=str(memory.unit_id),
+        text=memory.text,
+        fact_type=memory.fact_type,
+        context=memory.context,
+        occurred_start=_iso_or_none(memory.occurred_start),
+        occurred_end=_iso_or_none(memory.occurred_end),
+        mentioned_at=_iso_or_none(memory.mentioned_at),
+        document_id=memory.document_id,
+        metadata=meta,
+        chunk_id=memory.chunk_id,
+        tags=list(memory.tags or []) or None,
+        source_fact_ids=list(memory.source_memory_ids or []) or None,
+        scores=template.scores if template is not None else None,
+        entities=template.entities if template is not None else None,
+    )
+
+
+async def _snapshot_observations(
+    pool: DatabaseBackend,
+    bank_id: str,
+    unit_ids: list[str],
+    *,
+    conn=None,
+) -> dict[str, MemorySnapshot]:
+    """Authoritative snapshot of ``unit_ids`` keyed by unit id. Missing ids are omitted."""
+    if not unit_ids:
+        return {}
+    store = get_memories()
+    unique = list(dict.fromkeys(str(u) for u in unit_ids))
+
+    async def _load(c) -> dict[str, MemorySnapshot]:
+        snaps = await store.snapshot_memories(conn=c, fq_table=fq_table, bank_id=bank_id, unit_ids=unique)
+        return {str(s.memory.unit_id): s for s in snaps}
+
+    if conn is not None:
+        return await _load(conn)
+    async with acquire_with_retry(pool) as c:
+        return await _load(c)
+
+
+async def _bind_recalled_observations_to_snapshots(
+    pool: DatabaseBackend,
+    bank_id: str,
+    observations: list["MemoryFact"],
+) -> tuple[list["MemoryFact"], dict[str, str]]:
+    """Replace recalled observations with snapshot-backed copies taken BEFORE the LLM.
+
+    Missing rows are dropped so the LLM never sees a vanished observation. Tokens are
+    those of the StoredMemory objects used to rebuild the shown facts.
+    """
+    if not observations:
+        return [], {}
+    snaps = await _snapshot_observations(pool, bank_id, [str(o.id) for o in observations])
+    bound: list[MemoryFact] = []
+    revisions: dict[str, str] = {}
+    for obs in observations:
+        snap = snaps.get(str(obs.id))
+        if snap is None:
+            continue
+        bound.append(_memory_fact_from_stored(snap.memory, template=obs))
+        revisions[str(obs.id)] = snap.revision
+    return bound, revisions
 
 
 async def _prevalidate_prepared_batch(
@@ -974,15 +1074,43 @@ async def _prevalidate_prepared_batch(
     delete/update/create/source-mark/witness executes.
 
     Validates (fresh, under the guard):
+    - every observation shown to the main LLM (``observation_revisions``) still
+      matches its Phase-A token — missing or mutated -> stale;
     - every CREATE's source ids — liveness, unconsumed, unchanged, no twin (the
       existing :func:`_fresh_source_validation`);
-    - every UPDATE's target observation still exists AND its source ids are live/
-      unchanged/unconsumed;
-    - every DELETE's target observation still exists.
+    - every UPDATE's target observation still matches ``phase_a_revision`` AND its
+      source ids are live/unchanged/unconsumed;
+    - every DELETE's target observation still matches ``phase_a_revision``;
+    - every decision-relevant dedup candidate / fold twin still matches its Phase-A token.
 
     Returns ``"ok"`` when every plan is valid, or a short stale reason naming the
     first invalid element. The caller aborts the whole batch on any non-"ok".
     """
+
+    expected_obs = dict(prepared.observation_revisions or {})
+    for pupd in prepared.updates:
+        if pupd.phase_a_revision:
+            expected_obs.setdefault(str(pupd.update.observation_id), pupd.phase_a_revision)
+    for pdel in prepared.deletes:
+        if pdel.phase_a_revision:
+            expected_obs.setdefault(str(pdel.delete.observation_id), pdel.phase_a_revision)
+    for pcreate in prepared.creates:
+        if pcreate.phase_a_target_revision and pcreate.dedup_outcome and pcreate.dedup_outcome.best_id:
+            expected_obs.setdefault(str(pcreate.dedup_outcome.best_id), pcreate.phase_a_target_revision)
+        for cid, crev in (pcreate.candidate_revisions or {}).items():
+            expected_obs.setdefault(str(cid), crev)
+        if pcreate.dedup_outcome is not None:
+            for cid, crev in (pcreate.dedup_outcome.candidate_revisions or {}).items():
+                expected_obs.setdefault(str(cid), crev)
+
+    if expected_obs:
+        snaps = await _snapshot_observations(pool=None, bank_id=bank_id, unit_ids=list(expected_obs), conn=conn)
+        for oid, expected in expected_obs.items():
+            snap = snaps.get(str(oid))
+            if snap is None:
+                return f"observation_missing:{oid}"
+            if snap.revision != expected:
+                return f"observation_stale:{oid}"
 
     for pcreate in prepared.creates:
         stale_reason = await _fresh_source_validation(
@@ -1000,11 +1128,7 @@ async def _prevalidate_prepared_batch(
             return f"create_semantic_stale:{semantic_reason}"
 
     for pupd in prepared.updates:
-        # Target observation must still exist under the guard.
-        target_exists = await _observation_exists(conn, bank_id, pupd.update.observation_id)
-        if not target_exists:
-            return f"update_target_deleted:{pupd.update.observation_id}"
-        # Its source ids must still be live/unchanged/unconsumed.
+        # Source ids must still be live/unchanged/unconsumed (target token already compared).
         upd_source_ids = [m["id"] for m in pupd.source_mems]
         stale_reason = await _fresh_source_validation(
             conn=conn,
@@ -1014,11 +1138,6 @@ async def _prevalidate_prepared_batch(
         )
         if stale_reason != "ok":
             return f"update_source_stale:{stale_reason}"
-
-    for delete in prepared.deletes:
-        target_exists = await _observation_exists(conn, bank_id, delete.observation_id)
-        if not target_exists:
-            return f"delete_target_deleted:{delete.observation_id}"
 
     return "ok"
 
@@ -1038,9 +1157,7 @@ async def _observation_exists(
             observation_id,
         )
         return row is not None
-    present = await store.get_memories(
-        conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[observation_id]
-    )
+    present = await store.get_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[observation_id])
     return any(str(m.unit_id) == str(observation_id) for m in present)
 
 
@@ -1101,7 +1218,6 @@ async def _semantic_candidate_expansion(
     if fresh_hits:
         return f"semantic_twin_new_candidate:{sorted(fresh_hits)[:5]}"
     return "ok"
-
 
 
 class _CreateAction(BaseModel):
@@ -1195,6 +1311,10 @@ class _PreparedCreate:
     # probed (in-scope bounded top-K). Re-checked under the bank guard so a fresh
     # semantic twin above threshold aborts the batch instead of duplicating it.
     candidate_ids: set[str] = field(default_factory=set)
+    # Token of the fold twin (``dedup_outcome.best_id``) when Phase A decided to fold.
+    phase_a_target_revision: str | None = None
+    # Token of every probed candidate (same map as ``dedup_outcome.candidate_revisions``).
+    candidate_revisions: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -1206,6 +1326,17 @@ class _PreparedUpdate:
     agg: _SourceAggregation
     embedding_str: str | None
     dedup_outcome: "_DedupOutcome | None" = None
+    # Token of the UPDATE target as shown to the LLM (the snapshot-backed observation).
+    phase_a_revision: str = ""
+
+
+@dataclass
+class _PreparedDelete:
+    """One DELETE action prepared in Phase A, executed under CAS in Phase B."""
+
+    delete: _DeleteAction
+    # Token of the DELETE target as shown to the LLM.
+    phase_a_revision: str = ""
 
 
 @dataclass
@@ -1229,12 +1360,16 @@ class _PreparedBatch:
     union_observations: list["MemoryFact"]
     llm_result: _BatchLLMResult
     fact_tags: list[str]
-    deletes: list[_DeleteAction]
+    deletes: list[_PreparedDelete]
     updates: list[_PreparedUpdate]
     creates: list[_PreparedCreate]
     dedup_enabled: bool
     dedup_llm_config: Any = None
     source_snapshots: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Token of every observation shown to the main LLM, keyed by unit id. Derived from
+    # the StoredMemory snapshot taken BEFORE the LLM call (judge 76f0ac68).
+    observation_revisions: dict[str, str] = field(default_factory=dict)
+
 
 def _aggregate_source_fields(source_mems: list[dict[str, Any]], tags: list[str] | None = None) -> _SourceAggregation:
     """Compute the observation fields inherited from a set of source memories.
@@ -1905,7 +2040,6 @@ async def _run_consolidation_job(
         if not memories:
             break  # Nothing new left to try this invocation.
 
-
         # Group memories by exact tag set before batching — security requirement:
         # memories with different tags must never share an LLM call.
         tag_groups: dict[tuple[str, ...], list[dict[str, Any]]] = {}
@@ -1979,7 +2113,9 @@ async def _run_consolidation_job(
             reprepare_budget = int(getattr(config, "consolidation_reprepare_attempts", 1) or 0)
             max_attempts = 1 + reprepare_budget
 
-            async def _prepare_once(source_batch: list[dict[str, Any]]) -> tuple[list["_PreparedBatch"], list[Any], list[Any], list[dict[str, Any]]]:
+            async def _prepare_once(
+                source_batch: list[dict[str, Any]],
+            ) -> tuple[list["_PreparedBatch"], list[Any], list[Any], list[dict[str, Any]]]:
                 """Phase A for one attempt (off-connection): returns plans + source intent."""
                 plans: list["_PreparedBatch"] = []
                 succ: list[Any] = []
@@ -2115,17 +2251,32 @@ async def _run_consolidation_job(
                                 # subset into a partial commit.
                                 if prepared_plans:
                                     for prepared in prepared_plans:
-                                        reason = await _prevalidate_prepared_batch(prepared=prepared, conn=conn, bank_id=bank_id)
+                                        reason = await _prevalidate_prepared_batch(
+                                            prepared=prepared, conn=conn, bank_id=bank_id
+                                        )
                                         if reason != "ok":
-                                            logger.warning(f"[CONSOLIDATION] bank={bank_id} Phase-B prevalidation stale ({reason}); aborting whole batch with zero writes")
+                                            logger.warning(
+                                                f"[CONSOLIDATION] bank={bank_id} Phase-B prevalidation stale ({reason}); aborting whole batch with zero writes"
+                                            )
                                             raise _BatchStaleError(reason)
                                 for prepared in prepared_plans:
-                                    presults, pdeleted, pstale = await _commit_prepared_batch(prepared=prepared, pool=pool, memory_engine=memory_engine, bank_id=bank_id, config=config, perf=batch_perf, txn=_batch_txn, conn=conn)
+                                    presults, pdeleted, pstale = await _commit_prepared_batch(
+                                        prepared=prepared,
+                                        pool=pool,
+                                        memory_engine=memory_engine,
+                                        bank_id=bank_id,
+                                        config=config,
+                                        perf=batch_perf,
+                                        txn=_batch_txn,
+                                        conn=conn,
+                                    )
                                     if pstale:
                                         # CAS stale during mutation (final safety net): earlier plans
                                         # may already have written rows in THIS transaction; raising
                                         # rolls them all back together (one-batch/one-fate).
-                                        logger.warning(f"[CONSOLIDATION] bank={bank_id} CAS stale during mutation ({sorted(pstale)[:5]}); aborting whole batch")
+                                        logger.warning(
+                                            f"[CONSOLIDATION] bank={bank_id} CAS stale during mutation ({sorted(pstale)[:5]}); aborting whole batch"
+                                        )
                                         raise _BatchStaleError(f"cas_stale:{sorted(pstale)[:5]}")
                                     all_deleted += pdeleted
                                     stale_ids |= pstale
@@ -2136,25 +2287,65 @@ async def _run_consolidation_job(
                                             all_results.extend(presults)
                                         else:
                                             for i, (existing, new) in enumerate(zip(all_results, presults)):
-                                                if existing.get("action") == "skipped" and new.get("action") != "skipped":
+                                                if (
+                                                    existing.get("action") == "skipped"
+                                                    and new.get("action") != "skipped"
+                                                ):
                                                     all_results[i] = new
-                                                elif existing.get("action") != "skipped" and new.get("action") != "skipped":
-                                                    existing_created = existing.get("created", 1 if existing.get("action") == "created" else 0)
-                                                    existing_updated = existing.get("updated", 1 if existing.get("action") == "updated" else 0)
-                                                    new_created = new.get("created", 1 if new.get("action") == "created" else 0)
-                                                    new_updated = new.get("updated", 1 if new.get("action") == "updated" else 0)
-                                                    total = existing_created + existing_updated + new_created + new_updated
-                                                    all_results[i] = {"action": "multiple", "created": existing_created + new_created, "updated": existing_updated + new_updated, "merged": 0, "total_actions": total}
+                                                elif (
+                                                    existing.get("action") != "skipped"
+                                                    and new.get("action") != "skipped"
+                                                ):
+                                                    existing_created = existing.get(
+                                                        "created", 1 if existing.get("action") == "created" else 0
+                                                    )
+                                                    existing_updated = existing.get(
+                                                        "updated", 1 if existing.get("action") == "updated" else 0
+                                                    )
+                                                    new_created = new.get(
+                                                        "created", 1 if new.get("action") == "created" else 0
+                                                    )
+                                                    new_updated = new.get(
+                                                        "updated", 1 if new.get("action") == "updated" else 0
+                                                    )
+                                                    total = (
+                                                        existing_created + existing_updated + new_created + new_updated
+                                                    )
+                                                    all_results[i] = {
+                                                        "action": "multiple",
+                                                        "created": existing_created + new_created,
+                                                        "updated": existing_updated + new_updated,
+                                                        "merged": 0,
+                                                        "total_actions": total,
+                                                    }
                                 # Only a fully-validated batch may be marked / witnessed / decided.
                                 # Marks+witness also run when there are no prepared plans but LLM
                                 # failures occurred (failed_ids) — the all-LLM-failed case still needs
                                 # its failed marks + witness to share one logical write-group fate.
                                 if prepared_plans or failed_ids:
-                                    effective_succeeded = [mem_id for mem_id in succeeded_ids if str(mem_id) not in stale_ids]
+                                    effective_succeeded = [
+                                        mem_id for mem_id in succeeded_ids if str(mem_id) not in stale_ids
+                                    ]
                                     if effective_succeeded:
-                                        await store.mark_consolidated(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(mem_id) for mem_id in effective_succeeded], when=now, failed=False, txn=_batch_txn)
+                                        await store.mark_consolidated(
+                                            conn=conn,
+                                            fq_table=fq_table,
+                                            bank_id=bank_id,
+                                            unit_ids=[str(mem_id) for mem_id in effective_succeeded],
+                                            when=now,
+                                            failed=False,
+                                            txn=_batch_txn,
+                                        )
                                     if failed_ids:
-                                        await store.mark_consolidated(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(mem_id) for mem_id in failed_ids], when=now, failed=True, txn=_batch_txn)
+                                        await store.mark_consolidated(
+                                            conn=conn,
+                                            fq_table=fq_table,
+                                            bank_id=bank_id,
+                                            unit_ids=[str(mem_id) for mem_id in failed_ids],
+                                            when=now,
+                                            failed=True,
+                                            txn=_batch_txn,
+                                        )
                                     await _txn_provider.write_txn_witness(_batch_txn, conn=conn, fq_table=fq_table)
                                     # Persist this batch's mental-model refresh tags atomically with
                                     # the witness (#3411). Only succeeded sources contribute a tag.
@@ -2334,6 +2525,7 @@ async def _run_consolidation_job(
             await _txn_provider.decide_txn(_batch_txn, commit=True)
 
             return _BatchDeltas(stats=local_stats, tags=local_tags, cancelled=cancelled_local)
+
         # Number every batch up front so log line numbering is deterministic
         # regardless of dispatch order under parallelism. Each group keeps its own
         # (batch, number) list so it can be processed as one serial unit.
@@ -2703,6 +2895,14 @@ async def _prepare_memory_batch(
         if recall_result.source_facts:
             union_source_facts.update(recall_result.source_facts)
 
+    # Snapshot BEFORE the LLM so the shown observations and stored tokens are the
+    # same StoredMemory objects (judge 76f0ac68). Missing rows are dropped.
+    union_observations, observation_revisions = await _bind_recalled_observations_to_snapshots(
+        pool, bank_id, union_observations
+    )
+    live_obs_ids = set(observation_revisions)
+    per_fact_obs_ids = {mid: (ids & live_obs_ids) for mid, ids in per_fact_obs_ids.items()}
+
     # Determine effective tag scope for observations.
     # When obs_tags_override is set, use it; otherwise use the memory's own tags.
     if obs_tags_override is not None:
@@ -2768,7 +2968,7 @@ async def _prepare_memory_batch(
     # Phase A prepares each action's plan: source aggregation, embedding (slow), and
     # semantic-dedup adjudication (LLM) all happen here — off any write connection — so
     # Phase B holds the bank guard only for bounded reads + CAS writes.
-    prepared_deletes: list[_DeleteAction] = []
+    prepared_deletes: list[_PreparedDelete] = []
     prepared_updates: list[_PreparedUpdate] = []
     prepared_creates: list[_PreparedCreate] = []
 
@@ -2776,11 +2976,15 @@ async def _prepare_memory_batch(
         # Security: the observation must be present in the unioned recall.
         if not any(str(obs.id) == delete.observation_id for obs in union_observations):
             logger.debug(
-                f"Batch consolidation: rejected delete — observation {delete.observation_id} "
-                f"not in unioned recall"
+                f"Batch consolidation: rejected delete — observation {delete.observation_id} not in unioned recall"
             )
             continue
-        prepared_deletes.append(delete)
+        prepared_deletes.append(
+            _PreparedDelete(
+                delete=delete,
+                phase_a_revision=observation_revisions.get(str(delete.observation_id), ""),
+            )
+        )
 
     for update in llm_result.updates:
         source_mems = [mem_by_id[fid] for fid in update.source_fact_ids if fid in mem_by_id]
@@ -2811,13 +3015,16 @@ async def _prepare_memory_batch(
                     agg.tags,
                     exclude_id=update.observation_id,
                 )
-        prepared_updates.append(_PreparedUpdate(
-            update=update,
-            source_mems=source_mems,
-            agg=agg,
-            embedding_str=embedding_str,
-            dedup_outcome=dedup_outcome,
-        ))
+        prepared_updates.append(
+            _PreparedUpdate(
+                update=update,
+                source_mems=source_mems,
+                agg=agg,
+                embedding_str=embedding_str,
+                dedup_outcome=dedup_outcome,
+                phase_a_revision=observation_revisions.get(str(update.observation_id), ""),
+            )
+        )
 
     for create in llm_result.creates:
         source_mems = [mem_by_id[fid] for fid in create.source_fact_ids if fid in mem_by_id]
@@ -2856,15 +3063,23 @@ async def _prepare_memory_batch(
                 exclude_id=None,
             )
 
-        prepared_creates.append(_PreparedCreate(
-            create=create,
-            source_mems=source_mems,
-            agg=agg,
-            create_source_ids=create_source_ids,
-            dedup_outcome=dedup_outcome,
-            embedding_str=embedding_str,
-            candidate_ids=set(dedup_outcome.candidate_ids) if dedup_outcome is not None else set(),
-        ))
+        cand_revs = dict(dedup_outcome.candidate_revisions) if dedup_outcome is not None else {}
+        twin_rev = None
+        if dedup_outcome is not None and dedup_outcome.best_id is not None:
+            twin_rev = cand_revs.get(str(dedup_outcome.best_id))
+        prepared_creates.append(
+            _PreparedCreate(
+                create=create,
+                source_mems=source_mems,
+                agg=agg,
+                create_source_ids=create_source_ids,
+                dedup_outcome=dedup_outcome,
+                embedding_str=embedding_str,
+                candidate_ids=set(dedup_outcome.candidate_ids) if dedup_outcome is not None else set(),
+                phase_a_target_revision=twin_rev,
+                candidate_revisions=cand_revs,
+            )
+        )
 
     return _PreparedBatch(
         memories=memories,
@@ -2878,6 +3093,7 @@ async def _prepare_memory_batch(
         dedup_enabled=dedup_enabled,
         dedup_llm_config=dedup_llm_config,
         source_snapshots={str(m["id"]): _source_fingerprint(m) for m in memories},
+        observation_revisions=observation_revisions,
     )
 
 
@@ -2914,8 +3130,14 @@ async def _commit_prepared_batch(
     async def _write_body(wconn) -> None:
         nonlocal deleted_count
 
-        for delete in prepared.deletes:
-            await _execute_delete_action(conn=wconn, bank_id=bank_id, observation_id=delete.observation_id, txn=txn)
+        for pdel in prepared.deletes:
+            await _execute_delete_action(
+                conn=wconn,
+                bank_id=bank_id,
+                observation_id=pdel.delete.observation_id,
+                txn=txn,
+                expected_revision=pdel.phase_a_revision,
+            )
             deleted_count += 1
 
         for pupd in prepared.updates:
@@ -2936,6 +3158,7 @@ async def _commit_prepared_batch(
                 txn=txn,
                 conn=wconn,
                 precomputed_embedding=pupd.embedding_str,
+                expected_revision=pupd.phase_a_revision,
             )
             for m in pupd.source_mems:
                 per_memory_updated.add(str(m["id"]))
@@ -2998,6 +3221,7 @@ async def _commit_prepared_batch(
                     txn=txn,
                     conn=wconn,
                     outcome=pcreate.dedup_outcome,
+                    expected_revision=pcreate.phase_a_target_revision,
                 )
                 if merged_into is not None:
                     logger.info(
@@ -3197,6 +3421,7 @@ async def _execute_update_action(
     txn=None,
     conn=None,
     precomputed_embedding: str | None = None,
+    expected_revision: str | None = None,
 ) -> str | None:
     """
     Update an existing observation.
@@ -3306,12 +3531,12 @@ async def _execute_update_action(
             )
             if not snaps:
                 logger.debug(
-                    f"Update aborted: observation {observation_id} no longer exists "
-                    "(deleted/invalidated concurrently)"
+                    f"Update aborted: observation {observation_id} no longer exists (deleted/invalidated concurrently)"
                 )
                 raise _BatchStaleError(f"update_target_missing:{observation_id}")
             fresh = snaps[0].memory
-            expected_revision = snaps[0].revision
+            if not expected_revision:
+                raise _BatchStaleError(f"update_target_missing_phase_a_revision:{observation_id}")
             # Merge against the FRESH row (authoritative under the lock), not the Phase-A
             # ``model`` — LEAST/GREATEST semantics over existing + new values.
             fresh_source_ids = list(fresh.source_memory_ids or [])
@@ -3329,9 +3554,7 @@ async def _execute_update_action(
                 occurred_end=_merge_max(fresh.occurred_end, source_occurred_end),
                 mentioned_at=_merge_max(fresh.mentioned_at, source_mentioned_at),
                 source_memory_ids=merged_source_ids,
-                search_vector=(
-                    _native_search_vector_update(config, "{text_param}") or None
-                ),
+                search_vector=(_native_search_vector_update(config, "{text_param}") or None),
             )
             outcome = await store.cas_update_memory(
                 conn=conn,
@@ -3358,9 +3581,7 @@ async def _execute_update_action(
             # Upsert overwrites the whole observation, so start from its current state (fetched
             # from the store) and apply the same merge the SQL does — LEAST/GREATEST on the times
             # — while preserving fields the update never touches (event_date, created_at).
-            current = await store.get_memories(
-                conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[observation_id]
-            )
+            current = await store.get_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[observation_id])
             cur = current[0] if current else None
             await store.upsert_observation(
                 conn=conn,
@@ -3495,31 +3716,25 @@ async def _execute_delete_action(
     bank_id: str,
     observation_id: str,
     txn=None,
+    expected_revision: str | None = None,
 ) -> None:
     """Delete a superseded or contradicted observation.
 
     Blocker 5 (judge 5f7f900d): the target must be deleted through the store CAS seam, never
-    by an unconditional row delete. Snapshot it fresh under the caller's transaction, then
-    ``cas_delete_memory`` gated on the expected revision token; a concurrently-mutated/deleted
-    target returns STALE/MISSING -> raise ``_BatchStaleError`` so the whole original batch
-    rolls back with zero writes (Ruling 1).
+    by an unconditional row delete. ``cas_delete_memory`` is gated on the Phase-A revision
+    token; a concurrently-mutated/deleted target returns STALE/MISSING -> raise
+    ``_BatchStaleError`` so the whole original batch rolls back with zero writes (Ruling 1).
     """
     store = get_memories()
     if store.writes_memory_rows_in_sql_for(bank_id):
-        snaps = await store.snapshot_memories(
-            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[observation_id]
-        )
-        if not snaps:
-            logger.debug(
-                f"Delete aborted: observation {observation_id} already gone (CAS MISSING)"
-            )
-            raise _BatchStaleError(f"delete_target_missing:{observation_id}")
+        if not expected_revision:
+            raise _BatchStaleError(f"delete_target_missing_phase_a_revision:{observation_id}")
         outcome = await store.cas_delete_memory(
             conn=conn,
             fq_table=fq_table,
             bank_id=bank_id,
             unit_id=observation_id,
-            expected_revision=snaps[0].revision,
+            expected_revision=expected_revision,
         )
         if outcome == CASOutcome.STALE:
             logger.warning(
@@ -3884,7 +4099,9 @@ async def _create_observation_directly(
     if conn is None:
         async with acquire_with_retry(pool) as c:
             if not await _any_live_source_memory(c, bank_id, source_memory_ids):
-                logger.debug(f"Create skipped: all {len(source_memory_ids)} source memories were deleted before embedding")
+                logger.debug(
+                    f"Create skipped: all {len(source_memory_ids)} source memories were deleted before embedding"
+                )
                 return {"action": "skipped", "reason": "sources_deleted"}
 
     # Generate embedding for the observation (convert to string for pgvector) BEFORE

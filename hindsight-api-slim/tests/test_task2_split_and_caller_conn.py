@@ -104,9 +104,7 @@ def _patch_store(store):
 
     stack = ExitStack()
     stack.enter_context(_patch("hindsight_api.engine.memories.get_memories", lambda: store))
-    stack.enter_context(
-        _patch("hindsight_api.engine.consolidation.consolidator.get_memories", lambda: store)
-    )
+    stack.enter_context(_patch("hindsight_api.engine.consolidation.consolidator.get_memories", lambda: store))
     return stack
 
 
@@ -146,12 +144,12 @@ async def test_create_with_precomputed_outcome_skips_adjudication() -> None:
             AsyncMock(return_value=kwargs["create_source_ids"]),
         ),
     ):
-        result = await _dedup_reconcile_create(outcome=outcome, **kwargs)
+        result = await _dedup_reconcile_create(outcome=outcome, expected_revision="phase-a-twin", **kwargs)
     assert result == _TWIN_ID
     llm.call.assert_not_called()  # adjudication skipped — no LLM call
-    store.snapshot_memories.assert_awaited_once()  # fresh snapshot in Phase B
     store.cas_fold_observation.assert_awaited_once()
     assert store.cas_fold_observation.call_args.kwargs["merged_text"] == "merged text"
+    assert store.cas_fold_observation.call_args.kwargs["expected_revision"] == "phase-a-twin"
 
 
 async def test_update_with_precomputed_outcome_skips_adjudication() -> None:
@@ -242,6 +240,7 @@ async def test_dedup_fold_create_calller_mode_no_nested_txn() -> None:
             outcome=outcome,
             create_source_ids=live_ids,
             txn=None,
+            expected_revision="phase-a-twin",
         )
     assert result == _TWIN_ID
     assert conn.transaction_calls == 0  # never opened a nested transaction
