@@ -465,12 +465,10 @@ async def _dedup_fold_create(
     """CAS-protected Phase-B fold of a CREATE's sources into its near-twin (design §4.4).
 
     Runs inside the caller's write-group transaction (the bank guard when in Phase B).
-    Re-checks source liveness fresh, then folds via the store CAS seam: SQL stores use
-    ``cas_fold_observation`` gated on a freshly-snapshotted revision token (strictly stronger
-    than the old RETURNING text-guard — it catches any authoritative-field change, not just a
-    text rewrite); non-SQL stores fall back to ``_reconcile_merge_via_store`` until they ship a
-    real CAS implementation. Returns the twin id on APPLIED; None when there is no fold so the
-    caller proceeds with the CREATE (nothing is lost).
+    Re-checks source liveness fresh, then folds via the store CAS seam
+    (``cas_fold_observation`` gated on the Phase-A revision token). A store without a real
+    CAS implementation fails closed. Returns the twin id on APPLIED; None when there is no
+    fold so the caller proceeds with the CREATE (nothing is lost).
     """
     # Re-check liveness inside the fold transaction; CREATE performed the slow embed/LLM
     # work off-connection, so sources may have been deleted since the decision was made.
@@ -478,35 +476,30 @@ async def _dedup_fold_create(
     if not live_source_ids:
         return None
 
-    if store.writes_memory_rows_in_sql_for(bank_id):
-        expected_rev = expected_revision or ((outcome.candidate_revisions or {}).get(str(outcome.best_id)))
-        if not expected_rev:
-            logger.debug(
-                "[CONSOLIDATION] dedup-merge target %s has no Phase-A revision; proceeding with CREATE",
-                outcome.best_id[:8],
-            )
-            return None
-        folded = await store.cas_fold_observation(
-            conn=conn,
-            fq_table=fq_table,
-            bank_id=bank_id,
-            observation_id=outcome.best_id,
-            expected_revision=expected_rev,
-            merged_text=outcome.merged_text,
-            add_source_ids=[str(s) for s in live_source_ids],
+    expected_rev = expected_revision or ((outcome.candidate_revisions or {}).get(str(outcome.best_id)))
+    if not expected_rev:
+        logger.debug(
+            "[CONSOLIDATION] dedup-merge target %s has no Phase-A revision; proceeding with CREATE",
+            outcome.best_id[:8],
         )
-        if folded != CASOutcome.APPLIED:
-            # Twin changed since adjudication — do not clobber it; proceed with CREATE.
-            logger.debug(
-                "[CONSOLIDATION] dedup-merge target %s changed during window; proceeding with CREATE",
-                outcome.best_id[:8],
-            )
-            return None
-        return outcome.best_id
-
-    await _reconcile_merge_via_store(
-        store, conn, memory_engine, bank_id, outcome.best_id, outcome.merged_text, live_source_ids, txn=txn
+        return None
+    folded = await store.cas_fold_observation(
+        conn=conn,
+        fq_table=fq_table,
+        bank_id=bank_id,
+        observation_id=outcome.best_id,
+        expected_revision=expected_rev,
+        merged_text=outcome.merged_text,
+        add_source_ids=[str(s) for s in live_source_ids],
+        txn=txn,
     )
+    if folded != CASOutcome.APPLIED:
+        # Twin changed since adjudication — do not clobber it; proceed with CREATE.
+        logger.debug(
+            "[CONSOLIDATION] dedup-merge target %s changed during window; proceeding with CREATE",
+            outcome.best_id[:8],
+        )
+        return None
     return outcome.best_id
 
 
@@ -592,69 +585,57 @@ async def _dedup_fold_update(
     scope; matches create). The fold + delete share one logical write-group so the twin gains
     the sources exactly as the redundant row is removed; adjudication already ran connection-free.
 
-    SQL stores fold via ``cas_fold_observation`` gated on fresh revision tokens for both rows
-    (strictly stronger than the old RETURNING text-guard) and delete via ``cas_delete_memory``;
-    non-SQL stores fall back to ``_reconcile_merge_via_store`` until they ship real CAS.
+    Fold via ``cas_fold_observation`` gated on the twin's revision token and delete the
+    redundant row via ``cas_delete_memory``. A store without a real CAS implementation
+    fails closed.
     """
-    if store.writes_memory_rows_in_sql_for(bank_id):
-        # Snapshot both rows fresh under the caller's transaction. Lock order must be
-        # sources-before-observation: _filter_live_source_memories takes FOR SHARE on SOURCE rows
-        # first, then snapshot_memories/cas take FOR UPDATE on observation rows — same order as the
-        # normal write paths (_create_observation_directly / _execute_update_action).
-        upd_snap = await store.snapshot_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[updated_id])
-        if not upd_snap:
-            # Updated row vanished during the LLM window — nothing to reconcile.
-            return
-        upd_sources = list(upd_snap[0].memory.source_memory_ids or [])
-        live_u_sources = await _filter_live_source_memories(conn, bank_id, upd_sources)
-        if not live_u_sources:
-            return
-
-        twin_snap = await store.snapshot_memories(
-            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[outcome.best_id]
-        )
-        if not twin_snap:
-            # Twin vanished during the LLM window — keep the updated row as a distinct observation.
-            return
-
-        folded = await store.cas_fold_observation(
-            conn=conn,
-            fq_table=fq_table,
-            bank_id=bank_id,
-            observation_id=outcome.best_id,
-            expected_revision=twin_snap[0].revision,
-            merged_text=outcome.merged_text,
-            add_source_ids=[str(s) for s in live_u_sources],
-        )
-        if folded != CASOutcome.APPLIED:
-            # Twin changed during the window — keep the updated row instead of folding a stale twin.
-            return
-        # Fold applied: delete the now-redundant updated row via CAS + its history.
-        await store.cas_delete_memory(
-            conn=conn,
-            fq_table=fq_table,
-            bank_id=bank_id,
-            unit_id=updated_id,
-            expected_revision=upd_snap[0].revision,
-        )
-        await _delete_observation_history(conn, bank_id, updated_id)
-        logger.info(
-            "[CONSOLIDATION] dedup-merged updated observation %s into %s (cosine>=%.2f)",
-            updated_id[:8],
-            outcome.best_id[:8],
-            config.consolidation_dedup_threshold,
-        )
+    # Snapshot both rows fresh under the caller's transaction. Lock order must be
+    # sources-before-observation: _filter_live_source_memories takes FOR SHARE on SOURCE rows
+    # first, then snapshot_memories/cas take FOR UPDATE on observation rows — same order as the
+    # normal write paths (_create_observation_directly / _execute_update_action).
+    upd_snap = await store.snapshot_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[updated_id])
+    if not upd_snap:
+        # Updated row vanished during the LLM window — nothing to reconcile.
         return
-
-    updated_obs = await store.get_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[updated_id])
-    updated_sources = list(updated_obs[0].source_memory_ids or []) if updated_obs else []
-    live_u_sources = await _filter_live_source_memories(conn, bank_id, updated_sources)
+    upd_sources = list(upd_snap[0].memory.source_memory_ids or [])
+    live_u_sources = await _filter_live_source_memories(conn, bank_id, upd_sources)
     if not live_u_sources:
         return
-    await _reconcile_merge_via_store(
-        store, conn, memory_engine, bank_id, outcome.best_id, outcome.merged_text, live_u_sources, txn=txn
+
+    twin_snap = await store.snapshot_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[outcome.best_id])
+    if not twin_snap:
+        # Twin vanished during the LLM window — keep the updated row as a distinct observation.
+        return
+
+    folded = await store.cas_fold_observation(
+        conn=conn,
+        fq_table=fq_table,
+        bank_id=bank_id,
+        observation_id=outcome.best_id,
+        expected_revision=twin_snap[0].revision,
+        merged_text=outcome.merged_text,
+        add_source_ids=[str(s) for s in live_u_sources],
+        txn=txn,
     )
-    await _execute_delete_action(conn, bank_id, updated_id, txn=txn)
+    if folded != CASOutcome.APPLIED:
+        # Twin changed during the window — keep the updated row instead of folding a stale twin.
+        return
+    # Fold applied: delete the now-redundant updated row via CAS + its history.
+    await store.cas_delete_memory(
+        conn=conn,
+        fq_table=fq_table,
+        bank_id=bank_id,
+        unit_id=updated_id,
+        expected_revision=upd_snap[0].revision,
+        txn=txn,
+    )
+    await _delete_observation_history(conn, bank_id, updated_id)
+    logger.info(
+        "[CONSOLIDATION] dedup-merged updated observation %s into %s (cosine>=%.2f)",
+        updated_id[:8],
+        outcome.best_id[:8],
+        config.consolidation_dedup_threshold,
+    )
 
 
 @dataclass
@@ -1619,47 +1600,6 @@ def _merge_max(a: "datetime | str | None", b: "datetime | str | None") -> "datet
     """SQL ``GREATEST(a, COALESCE(b, a))`` in Python: the later of two times, ignoring None."""
     a, b = _as_dt(a), _as_dt(b)
     return a if b is None else b if a is None else max(a, b)
-
-
-async def _reconcile_merge_via_store(
-    store,
-    conn,
-    memory_engine: "MemoryEngine",
-    bank_id: str,
-    observation_id: str,
-    merged_text: str,
-    add_source_ids: list,
-    txn=None,
-) -> None:
-    """Dedup merge for a store that owns its rows: fold the extra source facts and the merged text
-    into the twin observation and re-upsert it, preserving its other fields. Re-embeds the merged
-    text because ``get_memories`` does not return the stored vector (the SQL path reuses it in
-    place instead)."""
-    current = await store.get_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[observation_id])
-    cur = current[0] if current else None
-    if cur is None:
-        return
-    merged_sources = list(dict.fromkeys([*(cur.source_memory_ids or []), *(str(s) for s in add_source_ids)]))
-    embeddings = await embedding_utils.generate_embeddings_batch(memory_engine.embeddings, [merged_text])
-    await store.upsert_observation(
-        conn=conn,
-        bank_id=bank_id,
-        txn=txn,
-        record=FactRecord(
-            unit_id=observation_id,
-            text=merged_text,
-            embedding=str(embeddings[0]) if embeddings else None,
-            fact_type="observation",
-            tags=list(cur.tags or []),
-            proof_count=len(merged_sources),
-            source_memory_ids=merged_sources,
-            event_date=cur.event_date,
-            occurred_start=cur.occurred_start,
-            occurred_end=cur.occurred_end,
-            mentioned_at=cur.mentioned_at,
-            created_at=cur.created_at,
-        ),
-    )
 
 
 async def _fetch_unconsolidated_rows(
@@ -3519,89 +3459,67 @@ async def _execute_update_action(
         merged_tags = list(existing_tags | source_tags)
 
         t0 = time.time()
-        if store.writes_memory_rows_in_sql_for(bank_id):
-            # Blocker 5 (judge 5f7f900d): the target observation must be mutated through the
-            # store CAS seam, never by an unconditional row update. Snapshot it fresh under the
-            # caller's transaction (bank -> observation lock order), then apply via
-            # ``cas_update_memory`` gated on the expected revision token. A concurrently-
-            # mutated/deleted target returns STALE/MISSING -> raise ``_BatchStaleError`` so the
-            # whole original batch rolls back with zero writes (Ruling 1).
-            snaps = await store.snapshot_memories(
-                conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[observation_id]
+        # Blocker 5 (judge 5f7f900d): the target observation must be mutated through the
+        # store CAS seam, never by an unconditional row update. Snapshot it fresh under the
+        # caller's transaction (bank -> observation lock order), then apply via
+        # ``cas_update_memory`` gated on the expected revision token. A concurrently-
+        # mutated/deleted target returns STALE/MISSING -> raise ``_BatchStaleError`` so the
+        # whole original batch rolls back with zero writes (Ruling 1). A store without a
+        # real CAS implementation fails closed.
+        snaps = await store.snapshot_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[observation_id])
+        if not snaps:
+            logger.debug(
+                f"Update aborted: observation {observation_id} no longer exists (deleted/invalidated concurrently)"
             )
-            if not snaps:
-                logger.debug(
-                    f"Update aborted: observation {observation_id} no longer exists (deleted/invalidated concurrently)"
-                )
-                raise _BatchStaleError(f"update_target_missing:{observation_id}")
-            fresh = snaps[0].memory
-            if not expected_revision:
-                raise _BatchStaleError(f"update_target_missing_phase_a_revision:{observation_id}")
-            # Merge against the FRESH row (authoritative under the lock), not the Phase-A
-            # ``model`` — LEAST/GREATEST semantics over existing + new values.
-            fresh_source_ids = list(fresh.source_memory_ids or [])
-            merged_source_ids = [str(s) for s in fresh_source_ids] + [str(mid) for mid in live_ids]
-            merged_source_ids = list(dict.fromkeys(merged_source_ids))
-            fresh_tags = set(fresh.tags or [])
-            merged_tags = list(fresh_tags | source_tags)
-            patch = MemoryPatch(
-                unit_id=observation_id,
-                text=new_text,
-                embedding=embedding_str,
-                tags=merged_tags,
-                proof_count_delta=len(merged_source_ids) - len(fresh_source_ids),
-                occurred_start=_merge_min(fresh.occurred_start, source_occurred_start),
-                occurred_end=_merge_max(fresh.occurred_end, source_occurred_end),
-                mentioned_at=_merge_max(fresh.mentioned_at, source_mentioned_at),
-                source_memory_ids=merged_source_ids,
-                search_vector=(_native_search_vector_update(config, "{text_param}") or None),
+            raise _BatchStaleError(f"update_target_missing:{observation_id}")
+        fresh = snaps[0].memory
+        if not expected_revision:
+            raise _BatchStaleError(f"update_target_missing_phase_a_revision:{observation_id}")
+        # Merge against the FRESH row (authoritative under the lock), not the Phase-A
+        # ``model`` — LEAST/GREATEST semantics over existing + new values.
+        fresh_source_ids = list(fresh.source_memory_ids or [])
+        merged_source_ids = [str(s) for s in fresh_source_ids] + [str(mid) for mid in live_ids]
+        merged_source_ids = list(dict.fromkeys(merged_source_ids))
+        fresh_tags = set(fresh.tags or [])
+        merged_tags = list(fresh_tags | source_tags)
+        patch = MemoryPatch(
+            unit_id=observation_id,
+            text=new_text,
+            embedding=embedding_str,
+            tags=merged_tags,
+            proof_count_delta=len(merged_source_ids) - len(fresh_source_ids),
+            occurred_start=_merge_min(fresh.occurred_start, source_occurred_start),
+            occurred_end=_merge_max(fresh.occurred_end, source_occurred_end),
+            mentioned_at=_merge_max(fresh.mentioned_at, source_mentioned_at),
+            source_memory_ids=merged_source_ids,
+            search_vector=(
+                _native_search_vector_update(config, "{text_param}")
+                if store.writes_memory_rows_in_sql_for(bank_id)
+                else None
+            ),
+        )
+        outcome = await store.cas_update_memory(
+            conn=conn,
+            fq_table=fq_table,
+            bank_id=bank_id,
+            unit_id=observation_id,
+            expected_revision=expected_revision,
+            patch=patch,
+            txn=txn,
+        )
+        if outcome == CASOutcome.STALE:
+            logger.warning(
+                f"Update aborted: observation {observation_id} mutated concurrently "
+                "(CAS STALE); aborting whole batch with zero writes"
             )
-            outcome = await store.cas_update_memory(
-                conn=conn,
-                fq_table=fq_table,
-                bank_id=bank_id,
-                unit_id=observation_id,
-                expected_revision=expected_revision,
-                patch=patch,
+            raise _BatchStaleError(f"update_target_stale:{observation_id}")
+        if outcome == CASOutcome.MISSING:
+            logger.warning(
+                f"Update aborted: observation {observation_id} deleted concurrently "
+                "(CAS MISSING); aborting whole batch with zero writes"
             )
-            if outcome == CASOutcome.STALE:
-                logger.warning(
-                    f"Update aborted: observation {observation_id} mutated concurrently "
-                    "(CAS STALE); aborting whole batch with zero writes"
-                )
-                raise _BatchStaleError(f"update_target_stale:{observation_id}")
-            if outcome == CASOutcome.MISSING:
-                logger.warning(
-                    f"Update aborted: observation {observation_id} deleted concurrently "
-                    "(CAS MISSING); aborting whole batch with zero writes"
-                )
-                raise _BatchStaleError(f"update_target_missing:{observation_id}")
-            source_ids = merged_source_ids
-        else:
-            # Upsert overwrites the whole observation, so start from its current state (fetched
-            # from the store) and apply the same merge the SQL does — LEAST/GREATEST on the times
-            # — while preserving fields the update never touches (event_date, created_at).
-            current = await store.get_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[observation_id])
-            cur = current[0] if current else None
-            await store.upsert_observation(
-                conn=conn,
-                bank_id=bank_id,
-                txn=txn,
-                record=FactRecord(
-                    unit_id=observation_id,
-                    text=new_text,
-                    embedding=embedding_str,
-                    fact_type="observation",
-                    tags=merged_tags,
-                    proof_count=len(source_ids),
-                    source_memory_ids=[str(s) for s in source_ids],
-                    event_date=cur.event_date if cur else None,
-                    occurred_start=_merge_min(model.occurred_start, source_occurred_start),
-                    occurred_end=_merge_max(model.occurred_end, source_occurred_end),
-                    mentioned_at=_merge_max(model.mentioned_at, source_mentioned_at),
-                    created_at=cur.created_at if cur else None,
-                ),
-            )
+            raise _BatchStaleError(f"update_target_missing:{observation_id}")
+        source_ids = merged_source_ids
 
         # Record the pre-update snapshot in the dedicated observation_history table
         # (one row per change), then trim to the configured cap. History lived in a
@@ -3726,30 +3644,28 @@ async def _execute_delete_action(
     ``_BatchStaleError`` so the whole original batch rolls back with zero writes (Ruling 1).
     """
     store = get_memories()
-    if store.writes_memory_rows_in_sql_for(bank_id):
-        if not expected_revision:
-            raise _BatchStaleError(f"delete_target_missing_phase_a_revision:{observation_id}")
-        outcome = await store.cas_delete_memory(
-            conn=conn,
-            fq_table=fq_table,
-            bank_id=bank_id,
-            unit_id=observation_id,
-            expected_revision=expected_revision,
+    if not expected_revision:
+        raise _BatchStaleError(f"delete_target_missing_phase_a_revision:{observation_id}")
+    outcome = await store.cas_delete_memory(
+        conn=conn,
+        fq_table=fq_table,
+        bank_id=bank_id,
+        unit_id=observation_id,
+        expected_revision=expected_revision,
+        txn=txn,
+    )
+    if outcome == CASOutcome.STALE:
+        logger.warning(
+            f"Delete aborted: observation {observation_id} mutated concurrently "
+            "(CAS STALE); aborting whole batch with zero writes"
         )
-        if outcome == CASOutcome.STALE:
-            logger.warning(
-                f"Delete aborted: observation {observation_id} mutated concurrently "
-                "(CAS STALE); aborting whole batch with zero writes"
-            )
-            raise _BatchStaleError(f"delete_target_stale:{observation_id}")
-        if outcome == CASOutcome.MISSING:
-            logger.warning(
-                f"Delete aborted: observation {observation_id} deleted concurrently "
-                "(CAS MISSING); aborting whole batch with zero writes"
-            )
-            raise _BatchStaleError(f"delete_target_missing:{observation_id}")
-    else:
-        await store.delete_facts(bank_id, [observation_id], txn=txn)
+        raise _BatchStaleError(f"delete_target_stale:{observation_id}")
+    if outcome == CASOutcome.MISSING:
+        logger.warning(
+            f"Delete aborted: observation {observation_id} deleted concurrently "
+            "(CAS MISSING); aborting whole batch with zero writes"
+        )
+        raise _BatchStaleError(f"delete_target_missing:{observation_id}")
     await _delete_observation_history(conn, bank_id, observation_id)
     logger.debug(f"Deleted observation {observation_id}")
 
