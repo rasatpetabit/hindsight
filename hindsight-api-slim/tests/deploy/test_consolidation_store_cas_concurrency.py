@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 
@@ -40,6 +41,7 @@ import sys as _sys
 import uuid
 from pathlib import Path
 from pathlib import Path as _Path
+from typing import Any
 
 import pytest
 
@@ -49,17 +51,432 @@ if str(_HARNESS_DIR) not in _sys.path:
 if "/tests" not in _sys.path:
     _sys.path.insert(0, "/tests")
 
-from cas_concurrency_harness import CasHarness, db_url, unique_bank  # noqa: E402
+from cas_concurrency_harness import CasHarness, unique_bank  # noqa: E402
 
 pytestmark = pytest.mark.asyncio
 
-# Container-gate: these tests exercise REAL production code and a real PG, so they only
-# run when HINDSIGHT_API_DATABASE_URL is set.
-_URL = db_url()
+# Module-level skip when the scratch PG URL is absent (mirrors the recovery module).
+_URL = os.getenv("HINDSIGHT_API_DATABASE_URL")
+if not _URL:
+    pytest.skip(
+        "HINDSIGHT_API_DATABASE_URL not set — store-CAS concurrency tests require a "
+        "pgvector PostgreSQL (e.g. postgresql://postgres:postgres@<host>:5432/hindsight)",
+        allow_module_level=True,
+    )
 
 
 def _harness() -> CasHarness:
     return CasHarness(_URL)
+
+
+# ---------------------------------------------------------------------------
+# LLM-window race helpers (Task 3)
+# ---------------------------------------------------------------------------
+
+
+async def _write_fingerprint(h: CasHarness, bank_id: str) -> dict[str, Any]:
+    """Persistent observation/source/history snapshot for zero-write proofs."""
+    from asyncpg.exceptions import UndefinedTableError
+
+    from hindsight_api.engine.memory_engine import fq_table
+
+    async with h.pool.acquire() as conn:
+        obs = await conn.fetch(
+            f"""
+            SELECT id::text AS id, text, proof_count,
+                   COALESCE(source_memory_ids::text, '') AS srcs
+            FROM {fq_table("memory_units")}
+            WHERE bank_id=$1 AND fact_type='observation'
+            ORDER BY id
+            """,
+            bank_id,
+        )
+        srcs = await conn.fetch(
+            f"""
+            SELECT id::text AS id, text,
+                   consolidated_at IS NOT NULL AS cons,
+                   consolidation_failed_at IS NOT NULL AS failed
+            FROM {fq_table("memory_units")}
+            WHERE bank_id=$1 AND fact_type <> 'observation'
+            ORDER BY id
+            """,
+            bank_id,
+        )
+        try:
+            hist = await conn.fetchval(
+                f"SELECT COUNT(*) FROM {fq_table('observation_history')} WHERE bank_id=$1",
+                bank_id,
+            )
+        except UndefinedTableError:
+            hist = 0
+    return {
+        "obs": [(r["id"], r["text"], r["proof_count"], r["srcs"]) for r in obs],
+        "srcs": [(r["id"], r["text"], r["cons"], r["failed"]) for r in srcs],
+        "hist": int(hist or 0),
+    }
+
+
+async def _set_observation(
+    h: CasHarness,
+    bank_id: str,
+    obs_id: str,
+    *,
+    text: str,
+    source_ids: list[str],
+) -> None:
+    from hindsight_api.engine.memory_engine import fq_table
+
+    async with h.pool.acquire() as conn:
+        await conn.execute(
+            f"""
+            UPDATE {fq_table("memory_units")}
+               SET text=$1,
+                   source_memory_ids=$2::uuid[],
+                   proof_count=$3
+             WHERE bank_id=$4 AND id=$5::uuid AND fact_type='observation'
+            """,
+            text,
+            [uuid.UUID(s) for s in source_ids],
+            len(source_ids),
+            bank_id,
+            obs_id,
+        )
+
+
+async def _delete_observation_row(h: CasHarness, bank_id: str, obs_id: str) -> None:
+    from hindsight_api.engine.memory_engine import fq_table
+
+    async with h.pool.acquire() as conn:
+        await conn.execute(
+            f"DELETE FROM {fq_table('memory_units')} WHERE bank_id=$1 AND id=$2::uuid",
+            bank_id,
+            obs_id,
+        )
+
+
+async def _run_llm_window_race(
+    *,
+    h: CasHarness,
+    bank_id: str,
+    mutate,
+    script_llm,
+    extra_patches: list | None = None,
+    mutate_once: bool = True,
+) -> dict[str, Any]:
+    """Run consolidation while a sidecar mutates after Phase A and before Phase B.
+
+    ``mutate`` runs after Phase A has snapshotted/shown the target (the LLM window)
+    and before Phase B is released. ``script_llm(attempt)`` returns a
+    ``_BatchLLMResult`` for that attempt. By default the mutation fires only on
+    the first window so ``fps_after_mutate[0] == fp_final`` proves both attempts
+    left zero persistent writes.
+    """
+    from contextlib import ExitStack, suppress
+    from unittest.mock import patch
+
+    import hindsight_api.engine.consolidation.consolidator as C
+
+    barrier = asyncio.Barrier(2)
+    prepare_calls = {"n": 0}
+    commit_calls = {"n": 0}
+    mutate_calls = {"n": 0}
+    fps_after_mutate: list[dict[str, Any]] = []
+    real_prepare = C._prepare_memory_batch
+    real_commit = C._commit_prepared_batch
+
+    async def _counting_commit(*args, **kwargs):
+        commit_calls["n"] += 1
+        return await real_commit(*args, **kwargs)
+
+    async def _scripted_llm(*args, **kwargs):
+        return script_llm(prepare_calls["n"] + 1)
+
+    async def _windowed_prepare(*args, **kwargs):
+        prepared = await real_prepare(*args, **kwargs)
+        prepare_calls["n"] += 1
+        await asyncio.wait_for(barrier.wait(), timeout=30)
+        await asyncio.wait_for(barrier.wait(), timeout=30)
+        return prepared
+
+    async def _sidecar():
+        try:
+            while True:
+                await asyncio.wait_for(barrier.wait(), timeout=30)
+                mutate_calls["n"] += 1
+                if not mutate_once or mutate_calls["n"] == 1:
+                    await mutate()
+                fps_after_mutate.append(await _write_fingerprint(h, bank_id))
+                await asyncio.wait_for(barrier.wait(), timeout=30)
+        except asyncio.CancelledError:
+            return
+
+    sidecar = asyncio.create_task(_sidecar())
+    try:
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(C, "_prepare_memory_batch", new=_windowed_prepare))
+            stack.enter_context(patch.object(C, "_commit_prepared_batch", new=_counting_commit))
+            stack.enter_context(patch.object(C, "_consolidate_batch_with_llm", new=_scripted_llm))
+            for extra in extra_patches or []:
+                stack.enter_context(extra)
+            result = await h.consolidate(bank_id)
+    finally:
+        sidecar.cancel()
+        with suppress(asyncio.CancelledError):
+            await sidecar
+
+    return {
+        "result": result,
+        "prepare_calls": prepare_calls["n"],
+        "commit_calls": commit_calls["n"],
+        "fps_after_mutate": fps_after_mutate,
+        "fp_final": await _write_fingerprint(h, bank_id),
+    }
+
+
+_TAGS = ["harness:pi", "proj:one"]
+
+_USER_TEXT_1 = "User rewrote the observation during the LLM window."
+_USER_TEXT_2 = "User rewrote the observation a second time."
+_USER_SRC_TEXT = "User-owned lineage fact."
+
+
+def _update_llm(obs_id: str, src_id: str, text: str):
+    import hindsight_api.engine.consolidation.consolidator as C
+
+    def _script(attempt: int):
+        return C._BatchLLMResult(
+            updates=[
+                C._UpdateAction(
+                    text=text,
+                    observation_id=obs_id,
+                    source_fact_ids=[src_id],
+                    reason="test-update",
+                )
+            ]
+        )
+
+    return _script
+
+
+def _delete_then_create_llm(obs_id: str, src_id: str, create_text: str):
+    import hindsight_api.engine.consolidation.consolidator as C
+
+    def _script(attempt: int):
+        if attempt == 1:
+            return C._BatchLLMResult(deletes=[C._DeleteAction(observation_id=obs_id, reason="test-delete")])
+        return C._BatchLLMResult(
+            creates=[C._CreateAction(text=create_text, source_fact_ids=[src_id], reason="test-create")]
+        )
+
+    return _script
+
+
+def _create_llm(src_id: str, text: str):
+    import hindsight_api.engine.consolidation.consolidator as C
+
+    def _script(attempt: int):
+        return C._BatchLLMResult(creates=[C._CreateAction(text=text, source_fact_ids=[src_id], reason="test-create")])
+
+    return _script
+
+
+def _assert_retryable(state: dict[str, Any], src_id: str) -> None:
+    assert state["exists"], f"source {src_id} vanished"
+    assert state["consolidated_at"] is None, f"source {src_id} marked consolidated: {state}"
+    assert state["failed_at"] is None, f"source {src_id} marked failed: {state}"
+
+
+async def test_cas_target_mutation_zero_write_reprepare():
+    """Design §6.6: mutate the UPDATE target during the LLM window.
+
+    First attempt must abort with zero persistent writes. Bounded reprepare (budget=1)
+    also aborts because the sidecar mutates again. The user's last mutation is the
+    surviving text and lineage; the consolidating source stays retryable.
+    """
+    async with _harness() as h:
+        bank_id = unique_bank("cas-mut")
+        await h.create_bank(bank_id)
+        orig_src = await h.seed_fact(bank_id, "Rivers flow downhill.", tags=_TAGS)
+        await h.mark_source(bank_id, orig_src)
+        user_src = await h.seed_fact(bank_id, _USER_SRC_TEXT, tags=_TAGS)
+        await h.mark_source(bank_id, user_src)
+        pending = await h.seed_fact(bank_id, "Rivers carve canyons over millennia.", tags=_TAGS)
+        obs_id = await h.seed_observation(bank_id, "Rivers flow downhill.", [orig_src], tags=_TAGS)
+
+        fp_before = await _write_fingerprint(h, bank_id)
+        mutate_n = {"n": 0}
+
+        async def _mutate():
+            mutate_n["n"] += 1
+            text = _USER_TEXT_1 if mutate_n["n"] == 1 else _USER_TEXT_2
+            await _set_observation(h, bank_id, obs_id, text=text, source_ids=[user_src])
+
+        race = await _run_llm_window_race(
+            h=h,
+            bank_id=bank_id,
+            mutate=_mutate,
+            script_llm=_update_llm(obs_id, pending, "Rivers flow downhill through valleys."),
+            mutate_once=False,
+        )
+
+        assert race["prepare_calls"] == 2, f"expected initial + 1 reprepare; got {race['prepare_calls']}"
+        assert race["commit_calls"] == 0, f"stale attempts must not commit; commits={race['commit_calls']}"
+        assert mutate_n["n"] >= 1, "mutation never ran inside the LLM window"
+
+        # First attempt: only the sidecar mutation landed (no consolidator writes).
+        fp1 = race["fps_after_mutate"][0]
+        assert fp1["hist"] == fp_before["hist"]
+        pending_row = next(r for r in fp1["srcs"] if r[0] == pending)
+        assert pending_row[2] is False and pending_row[3] is False, pending_row
+
+        obs = await h.observations(bank_id)
+        assert len(obs) == 1, f"expected the original observation only; got {obs}"
+        assert obs[0]["id"] == obs_id
+        assert obs[0]["text"] == _USER_TEXT_2
+        assert obs[0]["source_ids"] == [user_src]
+
+        _assert_retryable(await h.source_state(bank_id, pending), pending)
+        assert race["fp_final"]["hist"] == fp_before["hist"]
+
+
+async def test_cas_target_deletion_no_recreate():
+    """Design §6.7: delete the DELETE target during the LLM window.
+
+    The observation stays gone. Consolidation must not recreate it or mint a
+    replacement that inherits its id or lineage. Sources stay retryable.
+    """
+    async with _harness() as h:
+        bank_id = unique_bank("cas-del")
+        await h.create_bank(bank_id)
+        orig_src = await h.seed_fact(bank_id, "Rivers flow downhill.", tags=_TAGS)
+        await h.mark_source(bank_id, orig_src)
+        pending = await h.seed_fact(bank_id, "Rivers carve canyons over millennia.", tags=_TAGS)
+        obs_id = await h.seed_observation(bank_id, "Rivers flow downhill.", [orig_src], tags=_TAGS)
+        fp_before = await _write_fingerprint(h, bank_id)
+        mutate_n = {"n": 0}
+
+        async def _mutate():
+            mutate_n["n"] += 1
+            if mutate_n["n"] == 1:
+                await _delete_observation_row(h, bank_id, obs_id)
+            else:
+                from hindsight_api.engine.memory_engine import fq_table
+
+                async with h.pool.acquire() as conn:
+                    await conn.execute(
+                        f"UPDATE {fq_table('memory_units')} SET text=$1 WHERE bank_id=$2 AND id=$3::uuid",
+                        "Pending source rewritten during reprepare window.",
+                        bank_id,
+                        pending,
+                    )
+
+        race = await _run_llm_window_race(
+            h=h,
+            bank_id=bank_id,
+            mutate=_mutate,
+            script_llm=_delete_then_create_llm(obs_id, pending, "Rivers carve canyons over millennia."),
+            mutate_once=False,
+        )
+
+        assert race["prepare_calls"] == 2, f"expected initial + 1 reprepare; got {race['prepare_calls']}"
+        assert race["commit_calls"] == 0
+        obs = await h.observations(bank_id)
+        assert obs == [], f"deleted observation must stay gone with no replacement; got {obs}"
+        assert all(o["id"] != obs_id for o in obs)
+        assert all(orig_src not in o["source_ids"] for o in obs)
+        _assert_retryable(await h.source_state(bank_id, pending), pending)
+        assert race["fp_final"]["hist"] == fp_before["hist"]
+
+
+async def test_dedup_target_mutation_zero_write_reprepare():
+    """Design §6.6 fold-twin: mutate the dedup merge target during the LLM window."""
+    from unittest.mock import patch
+
+    import hindsight_api.engine.consolidation.consolidator as C
+
+    async with _harness() as h:
+        bank_id = unique_bank("dedup-tgt")
+        await h.create_bank(bank_id)
+        twin_src = await h.seed_fact(bank_id, "Alpha ships daily deploys.", tags=_TAGS)
+        await h.mark_source(bank_id, twin_src)
+        pending = await h.seed_fact(bank_id, "Alpha ships daily deploys on friday.", tags=_TAGS)
+        twin_id = await h.seed_observation(bank_id, "Alpha ships daily deploys.", [twin_src], tags=_TAGS)
+        fp_before = await _write_fingerprint(h, bank_id)
+        mutate_n = {"n": 0}
+        real_adj = C._dedup_adjudicate
+
+        async def _merge_adj(*args, **kwargs):
+            outcome = await real_adj(*args, **kwargs)
+            if outcome.best_id is None:
+                return outcome
+            return C._DedupOutcome(
+                best_id=outcome.best_id,
+                merged_text="merged by test",
+                should_merge=True,
+                best_text=outcome.best_text,
+                candidate_ids=set(outcome.candidate_ids),
+                candidate_revisions=dict(outcome.candidate_revisions),
+            )
+
+        async def _mutate():
+            mutate_n["n"] += 1
+            text = _USER_TEXT_1 if mutate_n["n"] == 1 else _USER_TEXT_2
+            await _set_observation(h, bank_id, twin_id, text=text, source_ids=[twin_src])
+
+        race = await _run_llm_window_race(
+            h=h,
+            bank_id=bank_id,
+            mutate=_mutate,
+            script_llm=_create_llm(pending, "Alpha ships daily deploys on friday."),
+            extra_patches=[patch.object(C, "_dedup_adjudicate", new=_merge_adj)],
+            mutate_once=False,
+        )
+
+        assert race["prepare_calls"] == 2, f"expected initial + 1 reprepare; got {race['prepare_calls']}"
+        assert race["commit_calls"] == 0
+        obs = await h.observations(bank_id)
+        assert len(obs) == 1, f"fold must not create a sibling; got {obs}"
+        assert obs[0]["id"] == twin_id
+        assert obs[0]["text"] == _USER_TEXT_2
+        assert obs[0]["source_ids"] == [twin_src]
+        _assert_retryable(await h.source_state(bank_id, pending), pending)
+        assert race["fp_final"]["hist"] == fp_before["hist"]
+
+
+async def test_dedup_candidate_mutation_zero_write_reprepare():
+    """Design §6.6 candidate: mutate a probed (non-folded) candidate during the LLM window."""
+    async with _harness() as h:
+        bank_id = unique_bank("dedup-cand")
+        await h.create_bank(bank_id)
+        cand_src = await h.seed_fact(bank_id, "Alpha ships daily deploys.", tags=_TAGS)
+        await h.mark_source(bank_id, cand_src)
+        pending = await h.seed_fact(bank_id, "Alpha ships daily deploys on friday.", tags=_TAGS)
+        cand_id = await h.seed_observation(bank_id, "Alpha ships daily deploys.", [cand_src], tags=_TAGS)
+        fp_before = await _write_fingerprint(h, bank_id)
+        mutate_n = {"n": 0}
+
+        async def _mutate():
+            mutate_n["n"] += 1
+            text = _USER_TEXT_1 if mutate_n["n"] == 1 else _USER_TEXT_2
+            await _set_observation(h, bank_id, cand_id, text=text, source_ids=[cand_src])
+
+        race = await _run_llm_window_race(
+            h=h,
+            bank_id=bank_id,
+            mutate=_mutate,
+            script_llm=_create_llm(pending, "Alpha ships daily deploys on friday."),
+            mutate_once=False,
+        )
+
+        assert race["prepare_calls"] == 2, f"expected initial + 1 reprepare; got {race['prepare_calls']}"
+        assert race["commit_calls"] == 0
+        obs = await h.observations(bank_id)
+        assert len(obs) == 1, f"candidate mutation must not spawn a CREATE; got {obs}"
+        assert obs[0]["id"] == cand_id
+        assert obs[0]["text"] == _USER_TEXT_2
+        assert obs[0]["source_ids"] == [cand_src]
+        _assert_retryable(await h.source_state(bank_id, pending), pending)
+        assert race["fp_final"]["hist"] == fp_before["hist"]
 
 
 def _json_load(p: Path) -> dict:
@@ -439,39 +856,11 @@ async def test_cross_bank_commit_overlap():
 async def test_user_mutation_caught_by_lock_or_cas():
     """Design §6.14: user/API mutation racing consolidation is caught by lock or CAS.
 
-    A user edits an existing observation; consolidation runs against the same bank. Because
-    Phase B takes FOR UPDATE on the bank row (and CAS compares fresh revisions for any fold),
-    the user's edited observation must survive — either verbatim or reconciled — never clobbered
-    to empty and never duplicated.
+    A user edits an existing observation *during the LLM window* (after Phase A has
+    snapshotted it, before Phase B). The first attempt must abort with zero writes;
+    the bounded reprepare then commits against the user's surviving lineage.
     """
-    from hindsight_api.engine.memory_engine import fq_table
-
-    async with _harness() as h:
-        bank_id = unique_bank("user-mut")
-        await h.create_bank(bank_id)
-        srcs = [await h.seed_fact(bank_id, f"User fact {i} about rivers.") for i in range(2)]
-        obs_id = await h.seed_observation(
-            bank_id,
-            "Rivers flow downhill.",
-            srcs,
-            tags=["harness:pi", "proj:one"],
-        )
-
-        # User edits the observation BEFORE consolidation runs.
-        async with h.pool.acquire() as conn:
-            await conn.execute(
-                f"UPDATE {fq_table('memory_units')} SET text=$1 WHERE id=$2::uuid AND bank_id=$3",
-                "Rivers flow downhill through valleys.",
-                obs_id,
-                bank_id,
-            )
-
-        await h.consolidate(bank_id)
-
-        obs_now = {o["id"]: o for o in await h.observations(bank_id)}
-        # The user's observation still exists with non-empty text (not clobbered / not deleted).
-        assert obs_now.get(obs_id), f"user observation vanished after consolidation: {obs_now}"
-        assert obs_now[obs_id]["text"].strip(), "observation text empty after consolidation"
+    await test_cas_target_mutation_zero_write_reprepare()
 
 
 # ---------------------------------------------------------------------------
@@ -1080,7 +1469,7 @@ async def test_new_twin_invalidates_create_plan_semantic_different_source(tmp_pa
 
             C._dedup_adjudicate = _controlled_adjudicate
             try:
-                result = await h.consolidate(bank_id)
+                await h.consolidate(bank_id)
             finally:
                 store.recall_unified = real_recall
                 C._dedup_adjudicate = real_adjudicate
@@ -1138,7 +1527,7 @@ async def test_semantic_twin_detection_stale_exhausts_zero_writes(tmp_path):
 
             store.recall_unified = _hide_twin_always
             try:
-                result = await h.consolidate(bank_id)
+                await h.consolidate(bank_id)
             finally:
                 store.recall_unified = real_recall
 
@@ -1170,7 +1559,7 @@ async def test_semantic_twin_below_threshold_no_stale(tmp_path):
             C.embedding_utils.generate_embeddings_batch = _text_aware_embed
             bank_id = unique_bank("sem-twin-below")
             await h.create_bank(bank_id)
-            src_a = await h.seed_fact(bank_id, "Alpha ships daily deploys on friday.")
+            await h.seed_fact(bank_id, "Alpha ships daily deploys on friday.")
             other_b = await h.seed_fact(bank_id, "Delta patches production hotfixes quarterly.")
 
             # Unrelated observation (shares no tokens -> below threshold).
@@ -1183,7 +1572,7 @@ async def test_semantic_twin_below_threshold_no_stale(tmp_path):
             # processes src_a (this is the negative control for the semantic lookup).
             await h.mark_source(bank_id, other_b)
 
-            result = await h.consolidate(bank_id)
+            await h.consolidate(bank_id)
 
             # Consolidation succeeded; a new observation for src_a was created (no endless retry).
             obs = await h.observations(bank_id)
@@ -1223,7 +1612,7 @@ async def test_reprepare_stale_once_then_success(tmp_path):
             return await real_prevalidate(prepared=prepared, conn=conn, bank_id=bank_id)
 
         with patch.object(C, "_prevalidate_prepared_batch", new=_stale_once):
-            result = await h.consolidate(bank_id)
+            await h.consolidate(bank_id)
 
         # Exactly one observation survived; source consolidated.
         obs = await h.observations(bank_id)
@@ -1283,7 +1672,7 @@ async def test_reprepare_executes_twice_and_no_busy_loop(tmp_path):
             patch.object(C, "_prevalidate_prepared_batch", new=_always_stale),
             patch.object(C, "_prepare_memory_batch", new=_counting_prepare),
         ):
-            result = await h.consolidate(bank_id)
+            await h.consolidate(bank_id)
 
         # Phase A ran a BOUNDED number of times: initial attempt + exactly ONE reprepare
         # (never endless). With 3 untagged sources sharing one sub-batch that is 2 calls;
@@ -1312,8 +1701,8 @@ async def test_reprepare_runs_outside_lock(tmp_path):
     async with _harness() as h:
         bank_id = unique_bank("reprepare-off-lock")
         await h.create_bank(bank_id)
-        src_a = await h.seed_fact(bank_id, "Foxtrot owns all nightly builds.")
-        src_b = await h.seed_fact(bank_id, "Golf publishes staging on monday.")
+        await h.seed_fact(bank_id, "Foxtrot owns all nightly builds.")
+        await h.seed_fact(bank_id, "Golf publishes staging on monday.")
 
         call_no = [0]
         locked_during_reprepare: list[bool] = []
@@ -1512,9 +1901,7 @@ async def test_delete_cas_stale_rolls_back_whole_batch():
         with patch.object(real_store, "cas_delete_memory", new=_stale_cas_delete):
             try:
                 async with h.pool.acquire() as conn:
-                    await C._execute_delete_action(
-                        conn=conn, bank_id=bank_id, observation_id=obs_id
-                    )
+                    await C._execute_delete_action(conn=conn, bank_id=bank_id, observation_id=obs_id)
                 raise AssertionError("expected _BatchStaleError on CAS STALE delete target")
             except C._BatchStaleError as e:
                 assert "delete_target_stale" in str(e), f"unexpected reason: {e}"
