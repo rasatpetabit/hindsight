@@ -1459,12 +1459,21 @@ async def test_new_twin_invalidates_create_plan_semantic_different_source(tmp_pa
                     return C._DedupOutcome(best_id=None, merged_text="", should_merge=False)
                 # Reprepare Phase A: fold src_a into the twin survivor. Include the twin in
                 # the candidate snapshot so the under-guard lookup does not re-abort attempt 2.
+                from hindsight_api.engine.memory_engine import fq_table as _fq
+
+                async with h.pool.acquire() as conn:
+                    snaps = await store.snapshot_memories(
+                        conn=conn, fq_table=_fq, bank_id=bank_id, unit_ids=[twin_id]
+                    )
+                twin_rev = snaps[0].revision if snaps else ""
                 return C._DedupOutcome(
                     best_id=twin_id,
                     merged_text=twin_text,
                     should_merge=True,
                     best_text=twin_text,
                     candidate_ids={twin_id},
+                    candidate_revisions={twin_id: twin_rev},
+                    merged_embedding=anchor_emb_str,
                 )
 
             C._dedup_adjudicate = _controlled_adjudicate
@@ -1804,6 +1813,9 @@ async def test_update_uses_precomputed_embedding_no_embedder_under_lock(tmp_path
 
         fact = MemoryFact(id=obs_id, text="Delta runs nightly checks.", fact_type="observation")
         async with h.pool.acquire() as conn:
+            snaps = await C.get_memories().snapshot_memories(
+                conn=conn, fq_table=C.fq_table, bank_id=bank_id, unit_ids=[obs_id]
+            )
             with patch.object(C.embedding_utils, "generate_embeddings_batch", new=_counting_embed):
                 emb = await C._execute_update_action(
                     pool=h.pool,
@@ -1817,6 +1829,7 @@ async def test_update_uses_precomputed_embedding_no_embedder_under_lock(tmp_path
                     txn=None,
                     conn=conn,
                     precomputed_embedding=precomputed,
+                    expected_revision=snaps[0].revision,
                 )
 
         assert call_count["n"] == 0, (
@@ -1850,13 +1863,16 @@ async def test_update_cas_stale_rolls_back_whole_batch():
         real_store = C.get_memories()
         precomputed = "[" + ",".join(["0.5"] * 384) + "]"
 
-        async def _stale_cas_update(*, conn, fq_table, bank_id, unit_id, expected_revision, patch):
+        async def _stale_cas_update(*, conn, fq_table, bank_id, unit_id, expected_revision, patch, txn=None):
             return CASOutcome.STALE
 
         with patch.object(real_store, "cas_update_memory", new=_stale_cas_update):
             fact = MemoryFact(id=obs_id, text="Echo balances every ledger.", fact_type="observation")
             try:
                 async with h.pool.acquire() as conn:
+                    snaps = await real_store.snapshot_memories(
+                        conn=conn, fq_table=C.fq_table, bank_id=bank_id, unit_ids=[obs_id]
+                    )
                     await C._execute_update_action(
                         pool=h.pool,
                         memory_engine=h.mem,
@@ -1869,6 +1885,7 @@ async def test_update_cas_stale_rolls_back_whole_batch():
                         txn=None,
                         conn=conn,
                         precomputed_embedding=precomputed,
+                        expected_revision=snaps[0].revision,
                     )
                 raise AssertionError("expected _BatchStaleError on CAS STALE update target")
             except C._BatchStaleError as e:
@@ -1895,13 +1912,21 @@ async def test_delete_cas_stale_rolls_back_whole_batch():
 
         real_store = C.get_memories()
 
-        async def _stale_cas_delete(*, conn, fq_table, bank_id, unit_id, expected_revision):
+        async def _stale_cas_delete(*, conn, fq_table, bank_id, unit_id, expected_revision, txn=None):
             return CASOutcome.STALE
 
         with patch.object(real_store, "cas_delete_memory", new=_stale_cas_delete):
             try:
                 async with h.pool.acquire() as conn:
-                    await C._execute_delete_action(conn=conn, bank_id=bank_id, observation_id=obs_id)
+                    snaps = await real_store.snapshot_memories(
+                        conn=conn, fq_table=C.fq_table, bank_id=bank_id, unit_ids=[obs_id]
+                    )
+                    await C._execute_delete_action(
+                        conn=conn,
+                        bank_id=bank_id,
+                        observation_id=obs_id,
+                        expected_revision=snaps[0].revision,
+                    )
                 raise AssertionError("expected _BatchStaleError on CAS STALE delete target")
             except C._BatchStaleError as e:
                 assert "delete_target_stale" in str(e), f"unexpected reason: {e}"
