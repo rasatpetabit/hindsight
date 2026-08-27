@@ -964,8 +964,11 @@ def _entity_map_from_results(
 
 def _is_non_retryable_task_error(e: Exception) -> bool:
     """Classify deterministic task failures that should skip worker retry."""
+    from .consolidation.consolidator import UnsupportedConsolidationDialectError
+
     return (
         isinstance(e, asyncpg.exceptions.IntegrityConstraintViolationError)
+        or isinstance(e, UnsupportedConsolidationDialectError)
         or _is_oracledb_integrity_error(e)
         or _is_invalid_embedding_dimension_error(e)
     )

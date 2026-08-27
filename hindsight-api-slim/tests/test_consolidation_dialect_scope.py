@@ -38,6 +38,13 @@ async def test_oracle_rejected_before_consolidation_dependencies():
     assert not backend.mock_calls
 
 
+def test_oracle_unsupported_error_is_non_retryable():
+    from hindsight_api.engine.memory_engine import _is_non_retryable_task_error
+
+    err = C.UnsupportedConsolidationDialectError("PostgreSQL-only")
+    assert _is_non_retryable_task_error(err) is True
+
+
 @pytest.mark.asyncio
 async def test_postgresql_still_delegates_to_consolidation_flow():
     resolved_config = SimpleNamespace()
