@@ -239,6 +239,39 @@ async def test_prevalidate_stales_on_delete_revision_mismatch():
 
 
 @pytest.mark.asyncio
+async def test_prevalidate_stales_on_conflicting_phase_a_tokens():
+    """Two Phase-A tokens for the same observation must not silently keep the first.
+
+    If the union-observation token matches the live row but the UPDATE token does not,
+    setdefault would pass. Conflict must be stale.
+    """
+    shown = _mem(unit_id="obs-upd", text="shown to llm")
+    store = _FakeStore({"obs-upd": MemorySnapshot(memory=shown, revision=memory_revision_token(shown))})
+    src = str(uuid.uuid4())
+    pupd = C._PreparedUpdate(
+        update=C._UpdateAction(text="new", observation_id="obs-upd", source_fact_ids=[src]),
+        source_mems=[{"id": src, "text": "src"}],
+        agg=_agg(),
+        embedding_str=None,
+        phase_a_revision="conflicting-token",
+    )
+    prepared = _empty_batch(
+        updates=[pupd],
+        memories=[{"id": src, "text": "src"}],
+        observation_revisions={"obs-upd": memory_revision_token(shown)},
+        source_snapshots={},
+    )
+    with (
+        patch.object(C, "get_memories", return_value=store),
+        patch.object(C, "_fresh_source_validation", new=AsyncMock(return_value="ok")),
+        patch.object(C, "_observation_exists", new=AsyncMock(return_value=True)),
+    ):
+        reason = await C._prevalidate_prepared_batch(prepared, conn=_Conn(), bank_id="b")
+    assert reason != "ok"
+    assert "obs-upd" in reason
+
+
+@pytest.mark.asyncio
 async def test_prevalidate_stales_on_fold_target_mismatch():
     twin = _mem(unit_id="twin", text="phase-a twin")
     later = _mem(unit_id="twin", text="mutated twin")

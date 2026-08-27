@@ -1085,21 +1085,46 @@ async def _prevalidate_prepared_batch(
     first invalid element. The caller aborts the whole batch on any non-"ok".
     """
 
-    expected_obs = dict(prepared.observation_revisions or {})
+    expected_obs: dict[str, str] = {}
+
+    def _record_expected(oid: str, rev: str | None) -> str | None:
+        if not rev:
+            return None
+        key = str(oid)
+        prior = expected_obs.get(key)
+        if prior is None:
+            expected_obs[key] = rev
+            return None
+        if prior != rev:
+            return f"observation_token_conflict:{key}"
+        return None
+
+    for oid, rev in (prepared.observation_revisions or {}).items():
+        conflict = _record_expected(oid, rev)
+        if conflict:
+            return conflict
     for pupd in prepared.updates:
-        if pupd.phase_a_revision:
-            expected_obs.setdefault(str(pupd.update.observation_id), pupd.phase_a_revision)
+        conflict = _record_expected(str(pupd.update.observation_id), pupd.phase_a_revision)
+        if conflict:
+            return conflict
     for pdel in prepared.deletes:
-        if pdel.phase_a_revision:
-            expected_obs.setdefault(str(pdel.delete.observation_id), pdel.phase_a_revision)
+        conflict = _record_expected(str(pdel.delete.observation_id), pdel.phase_a_revision)
+        if conflict:
+            return conflict
     for pcreate in prepared.creates:
-        if pcreate.phase_a_target_revision and pcreate.dedup_outcome and pcreate.dedup_outcome.best_id:
-            expected_obs.setdefault(str(pcreate.dedup_outcome.best_id), pcreate.phase_a_target_revision)
+        if pcreate.dedup_outcome and pcreate.dedup_outcome.best_id:
+            conflict = _record_expected(str(pcreate.dedup_outcome.best_id), pcreate.phase_a_target_revision)
+            if conflict:
+                return conflict
         for cid, crev in (pcreate.candidate_revisions or {}).items():
-            expected_obs.setdefault(str(cid), crev)
+            conflict = _record_expected(cid, crev)
+            if conflict:
+                return conflict
         if pcreate.dedup_outcome is not None:
             for cid, crev in (pcreate.dedup_outcome.candidate_revisions or {}).items():
-                expected_obs.setdefault(str(cid), crev)
+                conflict = _record_expected(cid, crev)
+                if conflict:
+                    return conflict
 
     if expected_obs:
         snaps = await _snapshot_observations(pool=None, bank_id=bank_id, unit_ids=list(expected_obs), conn=conn)
