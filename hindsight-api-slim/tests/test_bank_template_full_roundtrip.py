@@ -48,6 +48,7 @@ import pytest_asyncio
 
 from hindsight_api.api import create_app
 from hindsight_api.api.http import BankTemplateConfig
+from hindsight_api.config import HindsightConfig
 
 # One value per BankTemplateConfig field, each chosen to differ visibly from the
 # server default so a value that silently reverts is caught rather than matching
