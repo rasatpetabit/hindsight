@@ -118,7 +118,7 @@ class _PGHarness:
         async with self.backend.acquire() as conn:
             await conn.execute(
                 f"""
-                INSERT INTO {fq_table('memory_units')}
+                INSERT INTO {fq_table("memory_units")}
                     (id, bank_id, text, fact_type, embedding, event_date,
                      source_memory_ids, proof_count)
                 VALUES ($1,$2,$3,'observation',$4::vector,$5,$6::uuid[],$7)
@@ -135,22 +135,27 @@ class _PGHarness:
 
     async def snapshot(self, bank_id: str, unit_ids: list[str]):
         async with self.backend.acquire() as conn:
-            return await self.store.snapshot_memories(
-                conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=unit_ids
-            )
+            return await self.store.snapshot_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=unit_ids)
 
     async def update(self, bank_id: str, unit_id: str, rev: str, patch: MemoryPatch):
         async with self.backend.acquire() as conn:
             return await self.store.cas_update_memory(
-                conn=conn, fq_table=fq_table, bank_id=bank_id,
-                unit_id=unit_id, expected_revision=rev, patch=patch,
+                conn=conn,
+                fq_table=fq_table,
+                bank_id=bank_id,
+                unit_id=unit_id,
+                expected_revision=rev,
+                patch=patch,
             )
 
     async def delete(self, bank_id: str, unit_id: str, rev: str):
         async with self.backend.acquire() as conn:
             return await self.store.cas_delete_memory(
-                conn=conn, fq_table=fq_table, bank_id=bank_id,
-                unit_id=unit_id, expected_revision=rev,
+                conn=conn,
+                fq_table=fq_table,
+                bank_id=bank_id,
+                unit_id=unit_id,
+                expected_revision=rev,
             )
 
     async def fold(
@@ -161,6 +166,7 @@ class _PGHarness:
         merged_text: str,
         add_source_ids=None,
         *,
+        merged_embedding=None,
         tags=None,
         event_date=None,
         occurred_start=None,
@@ -169,9 +175,13 @@ class _PGHarness:
     ):
         async with self.backend.acquire() as conn:
             return await self.store.cas_fold_observation(
-                conn=conn, fq_table=fq_table, bank_id=bank_id,
-                observation_id=observation_id, expected_revision=rev,
+                conn=conn,
+                fq_table=fq_table,
+                bank_id=bank_id,
+                observation_id=observation_id,
+                expected_revision=rev,
                 merged_text=merged_text,
+                merged_embedding=merged_embedding,
                 add_source_ids=add_source_ids or [],
                 tags=tags,
                 event_date=event_date,
@@ -247,7 +257,9 @@ async def test_snapshot_token_changes_on_mutation(harness):
     rev0 = before[0].revision
 
     out = await harness.update(
-        bank, uid, rev0,
+        bank,
+        uid,
+        rev0,
         MemoryPatch(unit_id=uid, text="After mutation."),
     )
     assert out == CASOutcome.APPLIED
@@ -283,7 +295,9 @@ async def test_cas_update_applied_on_matching_revision(harness):
     rev0 = (await harness.snapshot(bank, [uid]))[0].revision
 
     out = await harness.update(
-        bank, uid, rev0,
+        bank,
+        uid,
+        rev0,
         MemoryPatch(unit_id=uid, text="updated"),
     )
     assert out == CASOutcome.APPLIED
@@ -299,10 +313,7 @@ async def test_cas_update_stale_no_write(harness):
     rev0 = (await harness.snapshot(bank, [uid]))[0].revision
 
     # First writer updates.
-    assert (
-        await harness.update(bank, uid, rev0, MemoryPatch(unit_id=uid, text="first writer"))
-        == CASOutcome.APPLIED
-    )
+    assert await harness.update(bank, uid, rev0, MemoryPatch(unit_id=uid, text="first writer")) == CASOutcome.APPLIED
 
     # Second writer holds the ORIGINAL revision — must be STALE and must not clobber.
     out2 = await harness.update(bank, uid, rev0, MemoryPatch(unit_id=uid, text="second writer"))
@@ -315,7 +326,9 @@ async def test_cas_update_stale_no_write(harness):
 async def test_cas_update_missing_target(harness):
     bank = await _unique_bank(harness)
     out = await harness.update(
-        bank, str(uuid.uuid4()), "whatever",
+        bank,
+        str(uuid.uuid4()),
+        "whatever",
         MemoryPatch(unit_id=str(uuid.uuid4()), text="x"),
     )
     assert out == CASOutcome.MISSING
@@ -329,7 +342,9 @@ async def test_cas_update_patch_fields_absolute_sets(harness):
 
     ed = datetime(2024, 3, 1, tzinfo=timezone.utc)
     out = await harness.update(
-        bank, uid, rev0,
+        bank,
+        uid,
+        rev0,
         MemoryPatch(
             unit_id=uid,
             tags=["new-tag"],
@@ -367,10 +382,7 @@ async def test_cas_delete_stale_no_write(harness):
     rev0 = (await harness.snapshot(bank, [uid]))[0].revision
 
     # mutate first -> revision now differs from rev0
-    assert (
-        await harness.update(bank, uid, rev0, MemoryPatch(unit_id=uid, text="mutated"))
-        == CASOutcome.APPLIED
-    )
+    assert await harness.update(bank, uid, rev0, MemoryPatch(unit_id=uid, text="mutated")) == CASOutcome.APPLIED
 
     # stale delete with original revision -> STALE and no delete
     out2 = await harness.delete(bank, uid, rev0)
@@ -441,9 +453,7 @@ async def test_cas_fold_stale_no_write(harness):
 
     # A concurrent writer mutates the observation first.
     assert (
-        await harness.update(
-            bank, obs_id, rev0, MemoryPatch(unit_id=obs_id, text="concurrent rewrite")
-        )
+        await harness.update(bank, obs_id, rev0, MemoryPatch(unit_id=obs_id, text="concurrent rewrite"))
         == CASOutcome.APPLIED
     )
 
@@ -506,3 +516,55 @@ async def test_cas_fold_honors_temporal_params(harness):
     assert snap.memory.occurred_end == end
     assert snap.memory.mentioned_at == mentioned
     assert snap.memory.tags == ["dated"]
+
+
+async def test_cas_fold_writes_merged_embedding_and_search_vector(harness):
+    """Task 7: fold must persist merged_embedding and recompute search_vector from merged_text.
+
+    Seeded observations start with a 0.2 embedding and no search_vector. After fold,
+    embedding must equal the passed merged vector and search_vector (when the backend
+    maintains one) must match to_tsvector of the merged text — not the original.
+    """
+    from hindsight_api.config import get_config
+    from hindsight_api.engine.db.ops_postgresql import pg_search_vector_expr
+
+    bank = await _unique_bank(harness)
+    s1 = await harness.seed_fact(bank, "source one", fact_type="experience")
+    obs_id = await harness.seed_observation(bank, "Ada handles infrastructure", [s1])
+    rev0 = (await harness.snapshot(bank, [obs_id]))[0].revision
+
+    merged_text = "Ada handles infrastructure and migrations"
+    merged_emb = _emb(0.9)
+    out = await harness.fold(
+        bank,
+        obs_id,
+        rev0,
+        merged_text=merged_text,
+        merged_embedding=merged_emb,
+        add_source_ids=[str(uuid.uuid4())],
+    )
+    assert out == CASOutcome.APPLIED
+
+    async with harness.backend.acquire() as conn:
+        row = await conn.fetchrow(
+            f"SELECT text, embedding::text AS emb, search_vector::text AS sv "
+            f"FROM {fq_table('memory_units')} WHERE bank_id=$1 AND id=$2::uuid",
+            bank,
+            obs_id,
+        )
+    assert row["text"] == merged_text
+    assert "0.9" in row["emb"], f"embedding still the seeded 0.2 vector: {row['emb'][:80]}"
+    assert "0.2" not in row["emb"] or row["emb"].count("0.9") >= 10
+
+    expr = pg_search_vector_expr(get_config(), text_col="$1", context_col="$2", signals_col=None)
+    if expr is None:
+        pytest.skip("search_vector is a dummy column on this backend")
+    async with harness.backend.acquire() as conn:
+        expected = await conn.fetchval(f"SELECT {expr}", merged_text, "")
+        actual = await conn.fetchval(
+            f"SELECT search_vector FROM {fq_table('memory_units')} WHERE bank_id=$1 AND id=$2::uuid",
+            bank,
+            obs_id,
+        )
+    assert actual is not None, "search_vector stayed NULL after fold"
+    assert str(actual) == str(expected)

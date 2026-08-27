@@ -609,9 +609,7 @@ async def cas_update_memory(
     revision, and applies only on a match — the CAS guarantee is "the authoritative state I saw
     in Phase A is unchanged". Returns APPLIED / STALE / MISSING; nothing is committed here.
     """
-    memory, current_rev = await _lock_and_revision(
-        conn=conn, fq_table=fq_table, bank_id=bank_id, unit_id=unit_id
-    )
+    memory, current_rev = await _lock_and_revision(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_id=unit_id)
     if memory is None:
         return CASOutcome.MISSING
     if current_rev != expected_revision:
@@ -633,7 +631,12 @@ async def cas_update_memory(
         sets.append(f"embedding = ${_param(str(patch.embedding))}::vector")
     if patch.tags is not None:
         sets.append(f"tags = ${_param(list(patch.tags))}")
-    if patch.event_date is not None or patch.occurred_start is not None or patch.occurred_end is not None or patch.mentioned_at is not None:
+    if (
+        patch.event_date is not None
+        or patch.occurred_start is not None
+        or patch.occurred_end is not None
+        or patch.mentioned_at is not None
+    ):
         # Temporal fields are absolute sets; JSONB cast keeps NULLs as-is.
         if patch.event_date is not None:
             sets.append(f"event_date = ${_param(patch.event_date)}")
@@ -683,9 +686,7 @@ async def cas_delete_memory(
 
     Locks FOR UPDATE, compares the authoritative revision, and deletes only on a match.
     Returns APPLIED / STALE / MISSING; nothing is committed here."""
-    memory, current_rev = await _lock_and_revision(
-        conn=conn, fq_table=fq_table, bank_id=bank_id, unit_id=unit_id
-    )
+    memory, current_rev = await _lock_and_revision(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_id=unit_id)
     if memory is None:
         return CASOutcome.MISSING
     if current_rev != expected_revision:
@@ -736,7 +737,7 @@ async def cas_fold_observation(
     params: list[Any] = [merged_text, bank_id, str(observation_id)]
 
     if merged_embedding is not None:
-        embedding_sql = (", embedding = $" + str(len(params) + 1))
+        embedding_sql = ", embedding = $" + str(len(params) + 1)
         params.append(str(merged_embedding))
     else:
         embedding_sql = ""
@@ -760,14 +761,21 @@ async def cas_fold_observation(
             temporal_clause += f", {_col} = $" + str(len(params) + 1)
             params.append(_val)
 
-    # Union sources + recompute proof_count; Oracle-safe search_vector clause kept empty for PG.
+    # Recompute search_vector from the merged text using the same backend-aware helper
+    # UPDATE uses. Dummy-column backends (pgroonga / pg_textsearch / pg_search) emit
+    # nothing; native/vchord populate the column from $1 (merged_text).
+    from ...db.ops_postgresql import pg_search_vector_expr
+
+    sv_expr = pg_search_vector_expr(get_config(), text_col="$1", context_col="''", signals_col=None)
+    search_vector_clause = f", search_vector = {sv_expr}" if sv_expr else ""
+
     await conn.execute(
         f"""
         UPDATE {mu}
         SET text = $1,
             source_memory_ids = (SELECT array_agg(DISTINCT e) FROM unnest(source_memory_ids || ${len(params) + 1}::uuid[]) e),
             proof_count = (SELECT count(DISTINCT e) FROM unnest(source_memory_ids || ${len(params) + 1}::uuid[]) e),
-            updated_at = now(){embedding_sql}{tags_clause}{temporal_clause}
+            updated_at = now(){embedding_sql}{tags_clause}{temporal_clause}{search_vector_clause}
         WHERE bank_id = $2 AND id = $3::uuid
         """,
         *params,

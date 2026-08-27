@@ -182,7 +182,7 @@ async def _run_delete(store, reconcile_spy):
         )
 
 
-async def _run_fold_create(store, reconcile_spy):
+async def _run_fold_create(store, reconcile_spy, *, merged_embedding=None):
     patches, src = _patches(store, reconcile_spy)
     outcome = C._DedupOutcome(
         best_id=TWIN_ID,
@@ -190,6 +190,7 @@ async def _run_fold_create(store, reconcile_spy):
         should_merge=True,
         candidate_ids={TWIN_ID},
         candidate_revisions={TWIN_ID: "phase-a-twin"},
+        merged_embedding=merged_embedding,
     )
     with ExitStack() as stack:
         for p in patches:
@@ -206,7 +207,7 @@ async def _run_fold_create(store, reconcile_spy):
         )
 
 
-async def _run_fold_update(store, reconcile_spy):
+async def _run_fold_update(store, reconcile_spy, *, merged_embedding=None):
     patches, _src = _patches(store, reconcile_spy)
     outcome = C._DedupOutcome(
         best_id=TWIN_ID,
@@ -214,6 +215,7 @@ async def _run_fold_update(store, reconcile_spy):
         should_merge=True,
         candidate_ids={TWIN_ID},
         candidate_revisions={TWIN_ID: "phase-a-twin"},
+        merged_embedding=merged_embedding,
     )
     with ExitStack() as stack:
         for p in patches:
@@ -302,6 +304,26 @@ async def test_nonsql_delete_calls_cas_delete_not_delete_facts():
     assert len(store.cas_delete_calls) == 1
     assert store.cas_delete_calls[0]["expected_revision"] == "phase-a"
     assert store.cas_delete_calls[0]["unit_id"] == OBS_ID
+
+
+@pytest.mark.asyncio
+async def test_fold_create_passes_merged_embedding():
+    store = _NonSqlStore(cas_impl=_WorkingCAS())
+    reconcile = AsyncMock()
+    await _run_fold_create(store, reconcile, merged_embedding="[0.77]")
+    assert store.cas_fold_calls, "cas_fold_observation was not called"
+    assert store.cas_fold_calls[0].get("merged_embedding") == "[0.77]"
+    assert store.cas_fold_calls[0]["merged_text"] == "merged"
+
+
+@pytest.mark.asyncio
+async def test_fold_update_passes_merged_embedding():
+    store = _NonSqlStore(cas_impl=_WorkingCAS())
+    reconcile = AsyncMock()
+    await _run_fold_update(store, reconcile, merged_embedding="[0.88]")
+    assert store.cas_fold_calls, "cas_fold_observation was not called"
+    assert store.cas_fold_calls[0].get("merged_embedding") == "[0.88]"
+    assert store.cas_fold_calls[0]["merged_text"] == "merged"
 
 
 @pytest.mark.asyncio

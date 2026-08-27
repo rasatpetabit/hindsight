@@ -145,6 +145,14 @@ async def _gather_or_cancel(coros: list[Any]) -> list[Any]:
         raise
 
 
+async def _merged_embedding_for_fold(memory_engine: "MemoryEngine", merged_text: str) -> str | None:
+    """Phase-A fold text embedding so cas_fold_observation can persist it with the merge."""
+    if not merged_text:
+        return None
+    embeddings = await embedding_utils.generate_embeddings_batch(memory_engine.embeddings, [merged_text])
+    return str(embeddings[0]) if embeddings else None
+
+
 def _native_search_vector_update(config, param: str) -> str:
     """UPDATE-clause fragment that repopulates ``search_vector`` inline, or ''
     when the backend does not maintain a native tsvector column that way.
@@ -291,6 +299,8 @@ class _DedupOutcome:
     # Opaque CAS token of every probed candidate, keyed by unit id. Tokens come from
     # the StoredMemory snapshot used for adjudication, not a later re-read.
     candidate_revisions: dict[str, str] = field(default_factory=dict)
+    # Embedding of ``merged_text``, computed in Phase A so Phase B never embeds under lock.
+    merged_embedding: str | None = None
 
 
 async def _dedup_adjudicate(
@@ -398,6 +408,7 @@ async def _dedup_adjudicate(
         best_text=best_text,
         candidate_ids=candidate_ids,
         candidate_revisions=candidate_revisions,
+        merged_embedding=await _merged_embedding_for_fold(memory_engine, merged_text),
     )
 
 
@@ -490,6 +501,7 @@ async def _dedup_fold_create(
         observation_id=outcome.best_id,
         expected_revision=expected_rev,
         merged_text=outcome.merged_text,
+        merged_embedding=outcome.merged_embedding,
         add_source_ids=[str(s) for s in live_source_ids],
         txn=txn,
     )
@@ -614,6 +626,7 @@ async def _dedup_fold_update(
         observation_id=outcome.best_id,
         expected_revision=twin_snap[0].revision,
         merged_text=outcome.merged_text,
+        merged_embedding=outcome.merged_embedding,
         add_source_ids=[str(s) for s in live_u_sources],
         txn=txn,
     )
