@@ -362,6 +362,44 @@ async def test_cas_update_patch_fields_absolute_sets(harness):
     assert snap.memory.proof_count >= 2
 
 
+async def test_cas_update_metadata_merges_keys(harness):
+    """Task 8a: metadata is a shallow jsonb || merge, not a full replace.
+
+    Existing keys survive an omitted-key patch; overlapping keys replace; ``{}`` is a no-op.
+    """
+    bank = await _unique_bank(harness)
+    uid = await harness.seed_fact(bank, "base")
+    async with harness.backend.acquire() as conn:
+        await conn.execute(
+            f"UPDATE {fq_table('memory_units')} SET metadata=$1::jsonb WHERE bank_id=$2 AND id=$3::uuid",
+            '{"keep": "old", "replace": "before"}',
+            bank,
+            uid,
+        )
+    rev0 = (await harness.snapshot(bank, [uid]))[0].revision
+
+    out = await harness.update(
+        bank,
+        uid,
+        rev0,
+        MemoryPatch(unit_id=uid, metadata={"replace": "after", "added": "new"}),
+    )
+    assert out == CASOutcome.APPLIED
+    snap = (await harness.snapshot(bank, [uid]))[0]
+    assert snap.memory.metadata == {"keep": "old", "replace": "after", "added": "new"}
+
+    rev1 = snap.revision
+    out2 = await harness.update(
+        bank,
+        uid,
+        rev1,
+        MemoryPatch(unit_id=uid, metadata={}),
+    )
+    assert out2 == CASOutcome.APPLIED
+    snap2 = (await harness.snapshot(bank, [uid]))[0]
+    assert snap2.memory.metadata == {"keep": "old", "replace": "after", "added": "new"}
+
+
 # --------------------------------------------------------------------------- cas_delete
 
 

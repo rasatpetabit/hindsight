@@ -647,7 +647,14 @@ async def cas_update_memory(
         if patch.mentioned_at is not None:
             sets.append(f"mentioned_at = ${_param(patch.mentioned_at)}")
     if patch.metadata is not None:
-        sets.append(f"metadata = ${_param(json.dumps(patch.metadata))}::jsonb")
+        # Shallow key merge: existing keys survive omitted keys; overlapping keys replace;
+        # ``{}`` is a no-op. Full replace would drop keys consolidation did not touch.
+        # JSON ``null`` (insert_facts of metadata=None) is not SQL NULL; jsonb || on it
+        # yields an array. Treat it as empty object so merge stays object-to-object.
+        sets.append(
+            "metadata = COALESCE(NULLIF(metadata, 'null'::jsonb), '{}'::jsonb)"
+            f" || ${_param(json.dumps(patch.metadata))}::jsonb"
+        )
     if patch.proof_count_delta:
         sets.append(f"proof_count = GREATEST(0, proof_count + ${_param(int(patch.proof_count_delta))})")
     if patch.source_memory_ids is not None:
