@@ -621,7 +621,9 @@ async def _dedup_fold_update(
         # Twin changed during the window — keep the updated row instead of folding a stale twin.
         return
     # Fold applied: delete the now-redundant updated row via CAS + its history.
-    await store.cas_delete_memory(
+    # If the leftover row is STALE/MISSING the fold already mutated the twin, so the
+    # only safe fate is aborting the whole batch (Ruling 1) rather than logging success.
+    delete_outcome = await store.cas_delete_memory(
         conn=conn,
         fq_table=fq_table,
         bank_id=bank_id,
@@ -629,6 +631,8 @@ async def _dedup_fold_update(
         expected_revision=upd_snap[0].revision,
         txn=txn,
     )
+    if delete_outcome != CASOutcome.APPLIED:
+        raise _BatchStaleError(f"dedup_delete_{delete_outcome.value}:{updated_id}")
     await _delete_observation_history(conn, bank_id, updated_id)
     logger.info(
         "[CONSOLIDATION] dedup-merged updated observation %s into %s (cosine>=%.2f)",

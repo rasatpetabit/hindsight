@@ -325,3 +325,58 @@ async def test_nonsql_fold_update_calls_cas_fold_and_delete_not_reconcile():
     assert store.cas_fold_calls[0]["observation_id"] == TWIN_ID
     assert len(store.cas_delete_calls) == 1
     assert store.cas_delete_calls[0]["unit_id"] == UPD_ID
+
+
+class _FoldAppliedDeleteOutcome:
+    def __init__(self, delete_outcome: CASOutcome):
+        self.delete_outcome = delete_outcome
+
+    async def cas_update_memory(self, **kwargs):
+        return CASOutcome.APPLIED
+
+    async def cas_fold_observation(self, **kwargs):
+        return CASOutcome.APPLIED
+
+    async def cas_delete_memory(self, **kwargs):
+        return self.delete_outcome
+
+
+@pytest.mark.parametrize("delete_outcome", [CASOutcome.STALE, CASOutcome.MISSING])
+@pytest.mark.asyncio
+async def test_fold_update_non_applied_delete_raises_batch_stale(delete_outcome, caplog):
+    """Task 6: a STALE/MISSING leftover-row delete must abort the batch.
+
+    History must not be deleted and the success log must not fire — the fold already
+    applied, so rolling back the whole transaction is the only safe fate.
+    """
+    store = _NonSqlStore(cas_impl=_FoldAppliedDeleteOutcome(delete_outcome))
+    history = AsyncMock()
+    reconcile = AsyncMock()
+    patches, _src = _patches(store, reconcile)
+    # Replace the default history stub with a spy we can assert on.
+    patches = [p for p in patches if getattr(p, "attribute", None) != "_delete_observation_history"]
+    patches.append(patch.object(C, "_delete_observation_history", new=history))
+    outcome = C._DedupOutcome(
+        best_id=TWIN_ID,
+        merged_text="merged",
+        should_merge=True,
+        candidate_ids={TWIN_ID},
+        candidate_revisions={TWIN_ID: "phase-a-twin"},
+    )
+    with ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        with pytest.raises(C._BatchStaleError) as exc:
+            await C._dedup_fold_update(
+                store=store,
+                conn=_Conn(),
+                memory_engine=_engine(),
+                bank_id="b",
+                config=_config(),
+                outcome=outcome,
+                updated_id=UPD_ID,
+                updated_text="updated",
+            )
+    assert UPD_ID in str(exc.value)
+    history.assert_not_awaited()
+    assert "dedup-merged updated observation" not in caplog.text
