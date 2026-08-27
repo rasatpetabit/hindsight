@@ -476,6 +476,11 @@ async def test_prepare_stores_token_of_snapshot_shown_to_llm_not_later_row():
         patch.object(C, "_effective_scope_limit", return_value=-1),
         patch.object(C, "get_memories", return_value=store),
         patch.object(C, "_dedup_active", return_value=False),
+        patch.object(
+            C.embedding_utils,
+            "generate_embeddings_batch",
+            new=AsyncMock(return_value=["[0.1]"]),
+        ),
     ):
         prepared = await C._prepare_memory_batch(
             pool=_Pool(),

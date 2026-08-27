@@ -2938,23 +2938,21 @@ async def _prepare_memory_batch(
             )
             continue
         agg = _aggregate_source_fields(source_mems, tags=fact_tags)
-        embedding_str: str | None = None
+        embeddings = await embedding_utils.generate_embeddings_batch(memory_engine.embeddings, [update.text])
+        embedding_str = str(embeddings[0]) if embeddings else None
         dedup_outcome: "_DedupOutcome | None" = None
-        if dedup_enabled:
-            embeddings = await embedding_utils.generate_embeddings_batch(memory_engine.embeddings, [update.text])
-            embedding_str = str(embeddings[0]) if embeddings else None
-            if embedding_str is not None:
-                dedup_outcome = await _dedup_adjudicate(
-                    pool,
-                    memory_engine,
-                    bank_id,
-                    config,
-                    dedup_llm_config,
-                    update.text,
-                    embedding_str,
-                    agg.tags,
-                    exclude_id=update.observation_id,
-                )
+        if dedup_enabled and embedding_str is not None:
+            dedup_outcome = await _dedup_adjudicate(
+                pool,
+                memory_engine,
+                bank_id,
+                config,
+                dedup_llm_config,
+                update.text,
+                embedding_str,
+                agg.tags,
+                exclude_id=update.observation_id,
+            )
         prepared_updates.append(
             _PreparedUpdate(
                 update=update,
@@ -2984,13 +2982,12 @@ async def _prepare_memory_batch(
             )
             continue
 
+        # Precompute the CREATE embedding in Phase A (design §4.2 — no embedder under
+        # the bank lock), even when dedup is disabled. Dedup adjudication reuses it.
+        embeddings = await embedding_utils.generate_embeddings_batch(memory_engine.embeddings, [create.text])
+        embedding_str = str(embeddings[0]) if embeddings else None
         dedup_outcome: "_DedupOutcome | None" = None
-        embedding_str: str | None = None
         if dedup_enabled:
-            # Precompute the CREATE embedding in Phase A (design §4.2 — no embedder
-            # under the bank lock). The dedup adjudication uses it as its probe vector.
-            embeddings = await embedding_utils.generate_embeddings_batch(memory_engine.embeddings, [create.text])
-            embedding_str = str(embeddings[0]) if embeddings else None
             dedup_outcome = await _dedup_adjudicate(
                 pool,
                 memory_engine,
@@ -3421,6 +3418,11 @@ async def _execute_update_action(
         embedding_str = precomputed_embedding
         if perf:
             perf.record_timing("embedding", 0.0)  # measured in Phase A; do not double-count under lock
+    elif conn is not None:
+        raise ValueError(
+            f"precomputed_embedding is required under the bank lock "
+            f"(observation {observation_id}); Phase A must embed off-connection"
+        )
     else:
         embeddings = await embedding_utils.generate_embeddings_batch(memory_engine.embeddings, [new_text])
         embedding_str = str(embeddings[0]) if embeddings else None
@@ -4029,6 +4031,8 @@ async def _create_observation_directly(
         embedding_str = precomputed_embedding
         if perf:
             perf.record_timing("embedding", 0.0)  # measured in Phase A; do not double-count under lock
+    elif conn is not None:
+        raise ValueError("precomputed_embedding is required under the bank lock; Phase A must embed off-connection")
     else:
         embeddings = await embedding_utils.generate_embeddings_batch(memory_engine.embeddings, [observation_text])
         embedding_str = str(embeddings[0]) if embeddings else None

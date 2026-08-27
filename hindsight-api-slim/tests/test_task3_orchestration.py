@@ -84,6 +84,11 @@ async def test_prepare_phase_a_performs_no_writes_and_no_lock():
         patch.object(C, "_find_related_observations", new=AsyncMock(return_value=fake_recall)),
         patch.object(C, "_consolidate_batch_with_llm", new=AsyncMock(return_value=llm_result)),
         patch.object(C, "_effective_scope_limit", return_value=-1),
+        patch.object(
+            C.embedding_utils,
+            "generate_embeddings_batch",
+            new=AsyncMock(return_value=["[0.1]"]),
+        ),
     ):
         prepared = await C._prepare_memory_batch(
             pool=_Pool(),
@@ -99,6 +104,7 @@ async def test_prepare_phase_a_performs_no_writes_and_no_lock():
     assert len(prepared.creates) == 1
     assert prepared.creates[0].create is create
     assert prepared.creates[0].create_source_ids == [mem_id]
+    assert prepared.creates[0].embedding_str == "[0.1]"
     assert len(prepared.deletes) == 0
     assert len(prepared.updates) == 0
     assert writes == [], f"Phase A issued {len(writes)} writes"
@@ -276,9 +282,7 @@ async def test_pg_bank_for_update_serializes_same_bank_writers():
 
         # A takes + holds the FOR UPDATE inside its own open transaction FIRST.
         async with conn_a.transaction():
-            await conn_a.execute(
-                f"SELECT bank_id FROM {C.fq_table('banks')} WHERE bank_id = $1 FOR UPDATE", bank_id
-            )
+            await conn_a.execute(f"SELECT bank_id FROM {C.fq_table('banks')} WHERE bank_id = $1 FOR UPDATE", bank_id)
             # Now start B: it will block on the FOR UPDATE until A commits.
             b_task = asyncio.create_task(b_writer())
             await asyncio.sleep(0.3)
