@@ -48,8 +48,6 @@ import pytest_asyncio
 
 from hindsight_api.api import create_app
 from hindsight_api.api.http import BankTemplateConfig
-from hindsight_api.config import HindsightConfig
-
 
 # One value per BankTemplateConfig field, each chosen to differ visibly from the
 # server default so a value that silently reverts is caught rather than matching
@@ -112,6 +110,7 @@ _SAMPLE_VALUES: dict[str, Any] = {
     "enable_auto_consolidation": False,
     "consolidation_max_memories_per_round": 42,
     "consolidation_llm_parallelism": 3,
+    "consolidation_reprepare_attempts": 2,
     "recall_include_chunks": True,
     "recall_max_tokens": 9000,
     "recall_chunks_max_tokens": 4500,

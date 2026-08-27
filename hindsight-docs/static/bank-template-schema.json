@@ -554,6 +554,21 @@
           "description": "Number of consolidation LLM batches processed concurrently",
           "title": "Consolidation Llm Parallelism"
         },
+        "consolidation_reprepare_attempts": {
+          "anyOf": [
+            {
+              "maximum": 8,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Max stale-reprepare attempts per consolidation LLM batch within one job (judge ruling 3; total Phase-A executions = 1 + this; range [0, 8])",
+          "title": "Consolidation Reprepare Attempts"
+        },
         "recall_include_chunks": {
           "anyOf": [
             {

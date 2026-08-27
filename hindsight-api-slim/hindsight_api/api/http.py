@@ -2692,7 +2692,9 @@ class BankTemplateConfig(BaseModel):
     )
     consolidation_reprepare_attempts: int | None = Field(
         default=None,
-        description="Max stale-reprepare attempts per consolidation LLM batch within one job (judge ruling 3; total Phase-A executions = 1 + this)",
+        ge=0,
+        le=8,
+        description="Max stale-reprepare attempts per consolidation LLM batch within one job (judge ruling 3; total Phase-A executions = 1 + this; range [0, 8])",
     )
     recall_include_chunks: bool | None = Field(default=None, description="Include raw chunks in recall results")
     recall_max_tokens: int | None = Field(default=None, description="Max tokens of results returned by recall")

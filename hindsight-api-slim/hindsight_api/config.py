@@ -1236,7 +1236,11 @@ DEFAULT_ENABLE_MENTAL_MODEL_HISTORY = True  # Mental model history tracking enab
 DEFAULT_MENTAL_MODEL_HISTORY_MAX_ENTRIES = 50
 DEFAULT_OBSERVATION_HISTORY_MAX_ENTRIES = 50
 DEFAULT_CONSOLIDATION_MAX_ATTEMPTS = 3  # Outer retry attempts for consolidation LLM batch calls
-DEFAULT_CONSOLIDATION_REPREPARE_ATTEMPTS = 1  # Extra Phase-A/B attempts for a stale batch (judge ruling 3); total attempts = 1 + this
+DEFAULT_CONSOLIDATION_REPREPARE_ATTEMPTS = (
+    1  # Extra Phase-A/B attempts for a stale batch (judge ruling 3); total attempts = 1 + this
+)
+CONSOLIDATION_REPREPARE_ATTEMPTS_MIN = 0
+CONSOLIDATION_REPREPARE_ATTEMPTS_MAX = 8
 DEFAULT_CONSOLIDATION_BATCH_SIZE = 50  # Memories to load per batch (internal memory optimization)
 DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND = (
     100  # Max memories per consolidation round (0 = unlimited). Limits how long one bank holds a worker slot.
@@ -3757,8 +3761,17 @@ class HindsightConfig:
             consolidation_max_attempts=int(
                 os.getenv(ENV_CONSOLIDATION_MAX_ATTEMPTS, str(DEFAULT_CONSOLIDATION_MAX_ATTEMPTS))
             ),
-            consolidation_reprepare_attempts=int(
-                os.getenv(ENV_CONSOLIDATION_REPREPARE_ATTEMPTS, str(DEFAULT_CONSOLIDATION_REPREPARE_ATTEMPTS))
+            consolidation_reprepare_attempts=max(
+                CONSOLIDATION_REPREPARE_ATTEMPTS_MIN,
+                min(
+                    CONSOLIDATION_REPREPARE_ATTEMPTS_MAX,
+                    int(
+                        os.getenv(
+                            ENV_CONSOLIDATION_REPREPARE_ATTEMPTS,
+                            str(DEFAULT_CONSOLIDATION_REPREPARE_ATTEMPTS),
+                        )
+                    ),
+                ),
             ),
             observations_mission=os.getenv(ENV_OBSERVATIONS_MISSION) or DEFAULT_OBSERVATIONS_MISSION,
             max_observations_per_scope=int(
